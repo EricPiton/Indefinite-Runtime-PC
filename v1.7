@@ -1,0 +1,107 @@
+// Constants (based on final design)
+CPU_POWER = 71 W                // i5-12400, BIOS-limited
+HEAT_FACTOR = 1.2              // 20% thermal overhead
+FERROFLUID_EFFICIENCY = 0.95   // 95% heat transfer efficiency
+STIRLING_MIN_EFF = 0.25        // Worst-case 25% efficiency
+STIRLING_MAX_EFF = 0.35        // Best-case 35% efficiency
+BREAKER_EFFICIENCY = 0.99      // 99% breaker efficiency
+MAX_LOAD = 20 W                // Maximum system load
+STORAGE_CAPACITY = 465 Wh      // Battery storage
+RESISTOR_CAPACITY = 100 W      // Excess dissipation capacity
+BOOT_ENERGY = 0.5 Wh           // Energy required for boot
+
+// Variables
+current_load = 0 W             // Dynamic load (0–20 W)
+storage_level = 465 Wh         // Current storage, starts full
+system_running = false         // System state
+time_step = 1 s                // Simulation time increment
+
+// Main system loop
+FUNCTION run_system()
+    WHILE true
+        IF NOT system_running THEN
+            CALL boot_system()
+        ELSE
+            CALL manage_power()
+        END IF
+        CALL update_storage()
+        CALL dissipate_excess()
+        WAIT time_step
+    END WHILE
+END FUNCTION
+
+// Boot sequence
+FUNCTION boot_system()
+    IF storage_level >= BOOT_ENERGY THEN
+        storage_level = storage_level - BOOT_ENERGY
+        system_running = true
+        PRINT "System booted successfully"
+    ELSE
+        PRINT "Insufficient storage for boot"
+    END IF
+END FUNCTION
+
+// Power generation and distribution
+FUNCTION manage_power()
+    // Calculate heat output
+    heat_output = CPU_POWER * HEAT_FACTOR
+    
+    // Ferrofluid heat transfer
+    ferrofluid_output = heat_output * FERROFLUID_EFFICIENCY
+    
+    // Stirling engine power generation (use min efficiency for safety)
+    stirling_output = ferrofluid_output * STIRLING_MIN_EFF
+    
+    // Breaker output
+    breaker_output = stirling_output * BREAKER_EFFICIENCY
+    
+    // Update current load (example: could be input or dynamic)
+    current_load = get_current_load()  // Assume 0–20 W, e.g., 20 W
+    
+    // Calculate excess or deficit
+    excess_power = breaker_output - current_load
+    
+    RETURN excess_power
+END FUNCTION
+
+// Storage management
+FUNCTION update_storage(excess_power)
+    IF excess_power > 0 THEN
+        // Convert W to Wh for time step (1 s = 1/3600 h)
+        energy_to_store = excess_power * (time_step / 3600)
+        IF storage_level + energy_to_store <= STORAGE_CAPACITY THEN
+            storage_level = storage_level + energy_to_store
+        ELSE
+            storage_level = STORAGE_CAPACITY
+        END IF
+    ELSE IF excess_power < 0 THEN
+        // Draw from storage if deficit
+        energy_needed = -excess_power * (time_step / 3600)
+        IF storage_level >= energy_needed THEN
+            storage_level = storage_level - energy_needed
+        ELSE
+            PRINT "Storage depleted, system shutting down"
+            system_running = false
+        END IF
+    END IF
+END FUNCTION
+
+// Excess power dissipation
+FUNCTION dissipate_excess(excess_power)
+    IF excess_power > 0 AND storage_level = STORAGE_CAPACITY THEN
+        IF excess_power <= RESISTOR_CAPACITY THEN
+            PRINT "Dissipating " + excess_power + " W via resistor"
+        ELSE
+            PRINT "Excess exceeds resistor capacity: " + excess_power + " W"
+        END IF
+    END IF
+END FUNCTION
+
+// Placeholder for dynamic load input
+FUNCTION get_current_load()
+    // Could be a sensor reading or user input, hardcoded for now
+    RETURN 20 W  // Example: max load
+END FUNCTION
+
+// Start the system
+CALL run_system()
