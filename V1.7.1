@@ -1,0 +1,109 @@
+# xai.Eric.piton.1.7.1
+# Fully Self-Sufficient Office PC with Stirling Engine (Realistic, Continuous Operation)
+# Date: April 08, 2025
+# Goal: Indefinite runtime post-boot with load spikes, storage as safety net
+# Author: Eric Piton, with assistance from Grok 3 (xAI)
+# Version: 1.7.1 - Stirling engine at magnet_end, realistic efficiencies, modified depletion logic
+
+# System Initialization
+# - Boot energy: 0.5 Wh from 1500 Wh storage
+# - Magnetic field: 1.0 T at hub (N pushes) and end (S pulls) for ferrofluid flow
+# - Storage: 1000 Wh battery + 500 Wh supercapacitors
+boot_energy = 0.5 Wh
+magnet_hub = 1.0 T  # North pole toward tube, shielded, at copper hub
+magnet_end = 1.0 T  # South pole pulls at tube end, Stirling engine location
+ferrofluid = "Ferrotec EFH1"  # High thermal conductivity ferrofluid
+storage_level = 1499.5 Wh  # Post-boot (1500 Wh - 0.5 Wh)
+storage_capacity = 1500 Wh  # Max capacity (1000 Wh battery + 500 Wh supercapacitors)
+system_running = True  # System state flag
+
+# Ferrofluid Heat Transfer Function
+# - Input: CPU and GPU power (W)
+# - Output: Heat delivered to Stirling engine at magnet_end (W)
+# - Process: Heat collected at hub, carried through tube, delivered at end
+function generate_heat(cpu_power, gpu_power):
+    cpu_heat = cpu_power * 1.2  # 20% inefficiency from CPU
+    gpu_heat = gpu_power * 1.2  # 20% inefficiency from GPU
+    total_heat = cpu_heat + gpu_heat  # Total heat generated (e.g., 54 W)
+    ferrofluid_start = collect_heat(total_heat, 
+                                   hub="copper_10000cm²",  # 10,000 cm² copper heat sink at magnet_hub
+                                   magnet_hub="1.0 T, N toward tube, shielded")  # Magnetic push at hub
+    ferrofluid_flow = circulate_ferrofluid(ferrofluid_start, 
+                                          magnet_hub="1.0 T, N pushes", 
+                                          magnet_end="1.0 T, S pulls", 
+                                          tube="50 mm copper, 2-loop, 1 m total")  # 2-loop, 1 m tube
+    ferrofluid_heat = transfer_heat(ferrofluid_flow, 
+                                   target="stirling_engine_at_magnet_end",  # Stirling at tube end
+                                   efficiency=0.95)  # 95% transfer efficiency (5% loss)
+    # Excess heat in ferrofluid returns to hub for dissipation or reuse
+    return ferrofluid_heat
+
+# Stirling Engine Power Conversion Function
+# - Location: At magnet_end, where ferrofluid delivers heat
+# - Input: Heat from ferrofluid (W)
+# - Output: Electrical power (W)
+# - Efficiency: 40%, waste heat returned via ferrofluid
+function convert_heat_to_power(heat):
+    stirling_input = heat  # Heat received at magnet_end (e.g., 51.3 W)
+    power_output = stirling_input * 0.40  # 40% conversion efficiency (e.g., 20.52 W)
+    waste_heat = stirling_input - power_output  # 60% waste heat (e.g., 30.78 W)
+    cool(waste_heat, 
+         fins="10000 cm²",  # 10,000 cm² fins at magnet_end for partial dissipation
+         passive=True)  # Passive cooling at Stirling unit
+    # Remaining waste heat returns via ferrofluid to magnet_hub
+    return power_output
+
+# Power Distribution Function
+# - Input: Generated power (W), total system load (W)
+# - Output: Excess power (W) or True if battery depleted
+# - Breaker efficiency: 98%, storage manages excess/deficit
+function distribute_power(power, total_load):
+    breaker_output = regulate(power, 
+                             voltage=12 V, 
+                             efficiency=0.98)  # 12V output, 98% efficiency (e.g., 20.1096 W)
+    excess_power = breaker_output - total_load  # Excess or deficit (W)
+    if excess_power > 0:
+        if storage_level < storage_capacity:
+            charge_storage(excess_power, 
+                          battery=1000 Wh, 
+                          supercapacitors=500 Wh)  # Charge battery, then supercaps
+            storage_level = storage_level + (excess_power / 3600)  # Wh update
+        else:
+            dissipate_excess(excess_power, 
+                            discharger="Ohmite TGHG, 100 W")  # Dissipate via resistor
+    elif excess_power < 0:
+        if storage_level > 0:
+            discharge = -excess_power
+            storage_level = storage_level - (discharge / 3600)  # Discharge storage
+        else:
+            print("Battery depleted, restart distribute_power")  # Warn, keep running
+            return True  # Rely on real-time power (20.1096 W max)
+    return excess_power
+
+# Main Operation Loop
+# - Fixed CPU/GPU power for consistent heat generation
+# - Load set externally (e.g., 16–20 W base, 26–30 W spikes)
+# - Continuous operation, no time dependency
+while system_running:
+    cpu_power = 35 W  # Mid-tier CPU (e.g., Intel i5 or Ryzen 5 in eco mode)
+    gpu_power = 10 W  # Low-power GPU (e.g., Intel UHD or NVIDIA GT 1030)
+    heat = generate_heat(cpu_power, gpu_power)  # Generates 54 W heat
+    power = convert_heat_to_power(heat)  # Converts to 20.52 W at magnet_end
+    total_load = adjust_load_for_self_sufficiency()  # External function (e.g., 16–30 W)
+    excess = distribute_power(power, total_load)
+    # Optional: Log excess, storage_level, total_load for real-time monitoring
+    sleep(1)  # 1-second cycle for control
+
+# Real-World Testing Notes:
+# - Hardware:
+#   - CPU: 35 W TDP (e.g., Intel Core i5-1340P)
+#   - GPU: 10 W (e.g., Intel UHD Graphics)
+#   - Stirling Engine: 20–25 W output, placed at magnet_end (tube exit)
+#   - Ferrofluid Loop: 50 mm copper tube, 1 m, 2 loops; 1.0 T magnets at hub/end
+#   - Storage: 1000 Wh LiFePO4 battery + 500 Wh supercapacitor bank
+#   - Cooling: 10,000 cm² fins at magnet_end, 10,000 cm² hub at magnet_hub
+# - Test Protocol:
+#   - Baseline: 16–20 W loads, verify 20.1096 W output and storage gain
+#   - Spikes: +10 W (26–30 W) for 300s, monitor storage drop/recovery
+#   - Depletion: Sustained 30 W until 0 Wh, test post-depletion at 20.1096 W
+# - Safety: Overheat sensors, breaker trip at >25 W output
