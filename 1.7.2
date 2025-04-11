@@ -1,0 +1,168 @@
+CPU_POWER = 80.0          # CPU power draw in watts (e.g., Intel Core i7-12700, eco-mode)
+HEAT_FACTOR = 1.2         # Heat output multiplier (20% inefficiency)
+FERROFLUID_EFF = 0.92     # Ferrofluid efficiency with insulated bronze tube
+STIRLING_EFF = 0.25       # Stirling engine efficiency (realistic at Delta T ~100°C)
+BREAKER_EFF = 0.99        # Breaker efficiency
+STORAGE_CAPACITY = 320.0  # Total storage: 300 Wh battery + 20 Wh supercapacitors
+BATTERY_CAPACITY = 300.0  # LiFePO4 battery capacity in watt-hours
+SUPERCAP_CAPACITY = 20.0  # Supercapacitor capacity in watt-hours
+RESISTOR_MAX = 50.0       # Ohmite resistor max dissipation in watts
+USB_MAX = 10.0            # USB charging max output in watts (5V, 2A)
+BOOT_ENERGY = 0.5         # Energy required for boot in watt-hours
+MAX_LOAD = 20.0           # Maximum system load in watts (excl. CPU heat loop)
+MIN_STORAGE = 5.0         # Minimum storage to avoid full depletion (Wh)
+THERMAL_LIMIT = 85.0      # Max CPU temperature in °C
+STIRLING_HOT_LIMIT = 120.0  # Max Stirling hot-side temperature in °C
+MIN_LOAD = 5.0            # Minimum load for basic operation in watts
+MAGNET_STRENGTH = 1.0     # Static magnetic field strength in tesla (N52 neodymium)
+TUBE_DIAMETER = 0.015     # Bronze tube diameter in meters (15 mm)
+TUBE_LENGTH = 0.5         # Total tube length in meters (2 loops)
+HUB_AREA = 3000.0         # Bronze hub/heatsink area in cm² (for thermal management)
+SENSOR_THRESHOLD = 0.1     # Min detectable flow anomaly (arbitrary units)
+
+# Variables
+current_load = 0.0        # Current system load in watts (5-20 W)
+battery_level = 300.0     # Current battery level in watt-hours
+supercap_level = 20.0     # Current supercapacitor level in watt-hours
+excess_power = 0.0        # Excess power after load in watts
+usb_power = 0.0           # Power rerouted to USB in watts
+time_step = 1.0           # Time step in seconds
+cpu_temp = 25.0           # Current CPU temperature in °C
+stirling_hot_temp = 25.0  # Current Stirling hot-side temperature in °C
+ferrofluid_flow = True    # Ferrofluid circulation state
+sensor_status = True      # Hub sensor state (thermal, flow)
+system_running = False     # System state flag
+
+# Function to manage ferrofluid circulation
+FUNCTION circulate_ferrofluid(heat_input):
+    IF ferrofluid_flow AND sensor_status:
+        # Check hub sensor (thermal, flow)
+        sensor_data = read_hub_sensor(
+            thermal="CPU temp",
+            flow="Ferrofluid velocity"
+        )
+        IF sensor_data["thermal"] > THERMAL_LIMIT OR sensor_data["flow"] < SENSOR_THRESHOLD:
+            print("Sensor anomaly detected, stopping circulation")
+            ferrofluid_flow = False
+            RETURN 0.0
+        
+        # Static magnetic drive
+        flow_status = check_magnetic_drive(
+            magnet_hub="1.0 T N pushes, hub side",
+            magnet_end="1.0 T S pulls, opposite hub side",
+            tube="15 mm insulated bronze, 2-loop, 0.5 m",
+            ferrofluid="Ferrotec EFH1"
+        )
+        IF flow_status:
+            heat_transferred = heat_input * FERROFLUID_EFF  # e.g., 96 W * 0.92 = 88.32 W
+            RETURN heat_transferred
+        ELSE:
+            print("Ferrofluid flow failure")
+            ferrofluid_flow = False
+            RETURN 0.0
+    ELSE:
+        print("Ferrofluid circulation offline")
+        RETURN 0.0
+
+# Function to calculate power output
+FUNCTION calculate_power_output():
+    heat_output = CPU_POWER * HEAT_FACTOR  # e.g., 80 W * 1.2 = 96 W
+    ferrofluid_output = circulate_ferrofluid(heat_output)  # e.g., 96 W * 0.92 = 88.32 W
+    IF ferrofluid_output = 0.0:
+        RETURN 0.0
+    stirling_output = ferrofluid_output * STIRLING_EFF  # e.g., 88.32 W * 0.25 = 22.08 W
+    breaker_output = stirling_output * BREAKER_EFF  # e.g., 22.08 W * 0.99 = 21.8592 W
+    IF stirling_hot_temp > STIRLING_HOT_LIMIT:
+        print("Stirling thermal limit exceeded")
+        RETURN 0.0
+    RETURN breaker_output
+
+# Function to manage excess or deficit
+FUNCTION manage_excess_deficit(power_output, load):
+    excess = power_output - load  # No controller power (static magnets)
+    IF excess > 0:
+        IF supercap_level < SUPERCAP_CAPACITY:
+            charge_amount = MIN(excess * time_step / 3600, SUPERCAP_CAPACITY - supercap_level)
+            supercap_level = supercap_level + charge_amount
+            excess = excess - (charge_amount * 3600 / time_step)
+        IF excess > 0 AND battery_level < BATTERY_CAPACITY:
+            charge_amount = MIN(excess * time_step / 3600, BATTERY_CAPACITY - battery_level)
+            battery_level = battery_level + charge_amount
+            excess = excess - (charge_amount * 3600 / time_step)
+        IF excess > 0:
+            usb_power = MIN(excess, USB_MAX)  # e.g., up to 10 W
+            excess = excess - usb_power
+        IF excess > 0:
+            excess_power = MIN(excess, RESISTOR_MAX)  # e.g., up to 50 W
+        ELSE:
+            excess_power = 0.0
+    ELSE IF excess < 0:
+        deficit = ABS(excess)
+        deficit_wh = deficit * time_step / 3600
+        IF supercap_level >= deficit_wh:
+            supercap_level = supercap_level - deficit_wh
+            excess_power = 0.0
+            usb_power = 0.0
+        ELSE IF battery_level >= deficit_wh:
+            battery_level = battery_level - deficit_wh
+            excess_power = 0.0
+            usb_power = 0.0
+        ELSE:
+            print("Storage insufficient, throttling load")
+            RETURN FALSE
+    RETURN TRUE
+
+# Function to adjust load dynamically
+FUNCTION adjust_load(power_output):
+    total_storage = battery_level + supercap_level
+    IF power_output >= current_load OR total_storage > MIN_STORAGE:
+        RETURN current_load
+    ELSE:
+        new_load = MAX(power_output, MIN_LOAD)  # e.g., 5 W minimum
+        print("Low storage, throttling load to ", new_load, " W")
+        RETURN new_load
+
+# Main system logic
+FUNCTION run_system():
+    # Boot phase
+    IF battery_level >= BOOT_ENERGY:
+        battery_level = battery_level - BOOT_ENERGY
+        system_running = True
+        print("System booted, battery at ", battery_level, " Wh")
+    ELSE:
+        print("Insufficient battery for boot")
+        RETURN FALSE
+    
+    # Main loop
+    WHILE system_running:
+        # Simulate thermal updates
+        cpu_temp = 25.0 + (CPU_POWER * 0.75)  # e.g., ~85°C at 80 W with 3000 cm² hub
+        stirling_hot_temp = 25.0 + (CPU_POWER * 0.6)  # e.g., ~73°C
+        
+        # Calculate power output
+        power_output = calculate_power_output()  # e.g., 21.8592 W
+        
+        # Adjust load dynamically
+        current_load = adjust_load(power_output)  # e.g., 5-20 W, throttled if needed
+        
+        # Manage power
+        IF NOT manage_excess_deficit(power_output, current_load):
+            print("Power failure, shutting down")
+            system_running = False
+            RETURN FALSE
+        
+        # Update storage and sensor status
+        total_storage = battery_level + supercap_level
+        IF total_storage <= MIN_STORAGE:
+            print("Warning: Storage critically low at ", total_storage, " Wh")
+        sensor_status = check_sensor_health()  # Simulated check
+        
+        # Log status
+        print("Load: ", current_load, " W, Power: ", power_output, " W, USB: ", usb_power, " W, Storage: ", total_storage, " Wh")
+        
+        sleep(time_step)  # 1-second cycle
+    
+    RETURN TRUE
+
+# Execute system
+run_system()
