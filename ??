@@ -1,0 +1,230 @@
+# Initialize Self-Sufficient PC
+boot_energy = 0.5 Wh  # EcoFlow 1440 Wh LiFePO4 battery
+system_power = 0 W
+waste_heat_input = 2000 W  # Server room exhaust, non-solar
+magnet_strength = 0.5 T  # CMS N52 neodymium, 0.2 T N45 backup
+magnet_temp = 25 °C      # TI TMP117, 3M 468MP ceramic insulation
+magnet_set = "primary"   # Tracks active magnet set (primary or backup)
+storage_level = 1008 Wh  # 70% of 1440 Wh usable
+system_running = True
+cpu_temp = 25 °C         # TI TMP117
+gpu_temp = 25 °C         # TI TMP117
+ferrofluid_flow = True   # Ferrotec EFH1, Ferrotec sensor, magnetic trap
+fan_active = False       # Noctua NF-A12x25, 0.5 W, activates at waste heat >50 W
+psu_ac_mode = False      # Seasonic Prime TX-1600, AC fallback for boot
+log_file = "system_status.log"
+min_storage_threshold = 201.6 Wh  # 20% of 1008 Wh
+total_load_min = 218.05 W  # Idle: 65 + 150 + 0.8 + 0.5 + 0.4 + 0.0 + 0.8 + 0.55
+total_load_max = 832.55 W  # Max: 230 + 600 + 0.8 + 0.5 + 0.4 + 0.5 + 0.8 + 0.55
+components = [
+    cpu: 65-230 W,   # AMD Ryzen 9 7950X, overclocked
+    gpu: 150-600 W,  # NVIDIA GeForce RTX 4090, overclocked
+    mb: 0.8 W,       # ASRock A620I Lightning WiFi
+    ram: 0.5 W,      # Kingston Fury Impact DDR5 16 GB
+    ssd: 0.4 W,      # Samsung 990 Pro 1 TB
+    fan: 0.0-0.5 W,  # Noctua NF-A12x25
+    charge: 0.8 W    # Texas Instruments BQ24650, max for higher loads
+    psu_teg: 0.55 W  # Seasonic Prime TX-1600, TEG control
+]
+
+# Boot Check with PSU AC Fallback
+function check_boot():
+    if storage_level < boot_energy:
+        log_warning(log_file, "Storage below 0.5 Wh: Booting with PSU AC mode")
+        psu_ac_mode = True
+        power = draw_ac_power(psu="Seasonic Prime TX-1600", voltage=12 V, efficiency=0.94)
+        return power
+    else:
+        psu_ac_mode = False
+        return 0 W
+
+# Ferrofluid Heat Transfer (Single Loop, Three Points)
+function generate_heat(cpu_power, gpu_power):
+    if not ferrofluid_flow:
+        log_error(log_file, "Ferrofluid flow failure: System halting")
+        return 0 W
+    magnet_temp = read_magnet_temp(sensor="TI TMP117", insulation="3M 468MP ceramic")
+    if magnet_temp > 70 °C:
+        if magnet_set == "primary":
+            log_warning(log_file, "Primary magnet temp " + magnet_temp + "°C: Switching to backup")
+            magnet_set = "backup"
+            magnet_strength = 0.2 T
+    cpu_heat = cpu_power * 1.2
+    gpu_heat = gpu_power * 1.2
+    # Point 1: CPU Heatsink Hub (Start/End)
+    point1_heat = cpu_heat + waste_heat_input  # 2078–2276 W
+    ferrofluid_heat = collect_heat(point1_heat, 
+                                   hub="Copper heatsink on CPU, Fractal Terra", 
+                                   magnet=magnet_strength + " CMS, set=" + magnet_set, 
+                                   tube="K&S 16 mm copper, 1.5 m single loop")
+    cpu_temp = estimate_cpu_temp(cpu_power, cooling="Noctua NH-D15S, 3M PCM, heat pipes")
+    if cpu_temp > 95 °C:
+        log_error(log_file, "Thermal limit exceeded: CPU=" + cpu_temp + "°C")
+        return 0 W
+    # Point 2: GPU with Triple-Stacked TEG
+    point2_heat = ferrofluid_heat * 0.95 + gpu_heat  # Add GPU heat, 95% transfer efficiency
+    teg_power2 = convert_heat_at_point(point2_heat * 0.5, teg="3x TEG4-242, triple-stacked")  # Assume 50% heat to TEG
+    ferrofluid_heat = point2_heat - teg_power2 / (0.32 * 0.99)  # Heat after TEG
+    gpu_temp = estimate_gpu_temp(gpu_power, cooling="Noctua NH-D15S, 3M PCM, heat pipes")
+    if gpu_temp > 95 °C:
+        log_error(log_file, "Thermal limit exceeded: GPU=" + gpu_temp + "°C")
+        return 0 W
+    # Point 3: Ending Loop with Triple-Stacked TEG and Heat Dispersal
+    point3_heat = ferrofluid_heat * 0.95  # 95% transfer efficiency
+    teg_power3 = convert_heat_at_point(point3_heat, teg="3x TEG4-242, triple-stacked")  # All remaining heat to TEG
+    total_teg_power = teg_power2 + teg_power3
+    waste_heat = point3_heat - teg_power3 / (0.32 * 0.99)  # Heat after TEG
+    disperse_excess_heat(waste_heat, method="Noctua NH-D15S, Ohmite TGHG 100 W")
+    total_heat = cpu_heat + gpu_heat + waste_heat_input  # 2258–2996 W, for logging
+    log_status(log_file, "Heat generated: " + total_heat + " W, CPU=" + cpu_temp + "°C, GPU=" + gpu_temp + "°C, Magnet=" + magnet_temp + "°C, TEG2=" + teg_power2 + " W, TEG3=" + teg_power3 + " W")
+    return total_teg_power  # 676.79–948.91 W
+
+# TEG Conversion at Specific Point
+function convert_heat_at_point(heat, teg):
+    if heat == 0 W:
+        log_error(log_file, "No heat input at " + teg + ": TEG offline")
+        return 0 W
+    teg_input = heat * 0.95  # 95% transfer efficiency
+    teg_power = teg_input * 0.16  # 32% total efficiency split across two TEGs (16% each)
+    teg_power = regulate(teg_power, voltage=12 V, efficiency=0.99, regulator="Texas Instruments BQ24650")
+    teg_health = check_teg_voltage(teg_power, sensor="Analog Devices AD5940")
+    if not teg_health:
+        log_error(log_file, "TEG failure detected at " + teg)
+        return 0 W
+    return teg_power
+
+# Disperse Excess Heat
+function disperse_excess_heat(heat, method):
+    cooling_status = cool(heat, method=method + ", fan=" + fan_active)
+    if not cooling_status:
+        log_error(log_file, "Cooling failure: Waste heat=" + heat + " W")
+        return False
+    if heat > 50 W and not fan_active:
+        fan_active = True
+        activate_fan(model="Noctua NF-A12x25", power=0.5 W)
+        log_status(log_file, "Waste heat " + heat + " W: Activating fan")
+    elif heat <= 50 W and fan_active:
+        fan_active = False
+        deactivate_fan(model="Noctua NF-A12x25")
+        log_status(log_file, "Waste heat " + heat + " W: Deactivating fan")
+    log_status(log_file, "Excess heat dispersed: " + heat + " W")
+    return True
+
+# Power Distribution
+function distribute_power(power, total_load):
+    ac_power = 0 W
+    if psu_ac_mode:
+        ac_power = draw_ac_power(psu="Seasonic Prime TX-1600", voltage=12 V, efficiency=0.94)
+        log_status(log_file, "PSU AC mode: Providing " + ac_power + " W")
+    breaker_output = power * 0.94
+    if breaker_output < total_load:
+        deficit = total_load - breaker_output
+        if storage_level > 0 Wh:
+            discharge_storage(deficit, battery="EcoFlow 1440 Wh LiFePO4")
+            storage_level = storage_level - (deficit / 3600)
+            log_status(log_file, "Discharging storage: " + deficit + " W, Level=" + storage_level + " Wh")
+            breaker_output = total_load
+        else:
+            log_status(log_file, "Storage depleted: Throttling to idle")
+            return 0 W
+    distribute_to_components(breaker_output, 
+                            psu="Seasonic Prime TX-1600", 
+                            connectors=["24-pin ATX", "8-pin EPS", "SATA", "auxiliary"])
+    excess_power = breaker_output - total_load
+    if excess_power > 0 W:
+        if storage_level < 1008 Wh:
+            charge_storage(excess_power, battery="EcoFlow 1440 Wh LiFePO4")
+            storage_level = storage_level + (excess_power / 3600)
+            log_status(log_file, "Charging storage: " + excess_power + " W, Level=" + storage_level + " Wh")
+        else:
+            dissipate_excess(excess_power, discharger="Ohmite TGHG 100 W")
+            log_status(log_file, "Dissipating excess power: " + excess_power + " W")
+    return excess_power
+
+# Adjust Load
+function adjust_load_for_self_sufficiency(power, storage_level):
+    total_load_min = 218.05 W if not fan_active else 218.55 W
+    total_load_max = 832.05 W if not fan_active else 832.55 W
+    total_load_mid = 525.3 W if not fan_active else 525.8 W
+    if storage_level <= min_storage_threshold:
+        log_status(log_file, "Storage below 20% (" + storage_level + " Wh): Forcing idle")
+        return total_load_min
+    if power * 0.94 >= total_load_max:
+        log_status(log_file, "Full load: " + total_load_max + " W")
+        return total_load_max
+    elif power * 0.94 >= total_load_mid:
+        log_status(log_file, "50% load: " + total_load_mid + " W")
+        return total_load_mid
+    elif power * 0.94 >= total_load_min:
+        cpu_power = (power * 0.94 - (3.05 if fan_active else 2.55)) * 0.28
+        gpu_power = (power * 0.94 - (3.05 if fan_active else 2.55)) * 0.72
+        cpu_power = min(cpu_power, 230 W)
+        gpu_power = min(gpu_power, 600 W)
+        total_load = cpu_power + gpu_power + (3.05 if fan_active else 2.55)
+        log_status(log_file, "Adjusted load: " + total_load + " W, CPU=" + cpu_power + " W, GPU=" + gpu_power + " W")
+        return total_load
+    else:
+        log_status(log_file, "Idle load: " + total_load_min + " W")
+        return total_load_min
+
+# Monitor Ferrofluid Flow (Single Loop, Magnet-Driven)
+function monitor_ferrofluid_flow():
+    flow_status = check_flow(magnet=magnet_strength + " CMS, set=" + magnet_set, 
+                            tube="K&S 16 mm copper, 1.5 m single loop", 
+                            sensor="Ferrotec susceptibility", 
+                            filter="Ferrotec magnetic trap")
+    if not flow_status:
+        log_error(log_file, "Ferrofluid flow stopped")
+        return False
+    backup_status = check_backup_magnets(magnet="0.2 T CMS N45")
+    if not backup_status:
+        log_warning(log_file, "Backup magnets offline")
+    return True
+
+# Main Loop
+while system_running:
+    boot_power = check_boot()
+    if boot_power > 0 W:
+        distribute_to_components(boot_power, 
+                                psu="Seasonic Prime TX-1600", 
+                                connectors=["24-pin ATX", "8-pin EPS", "SATA", "auxiliary"])
+    ferrofluid_flow = monitor_ferrofluid_flow()
+    if not ferrofluid_flow:
+        log_error(log_file, "Ferrofluid flow failure: System halting")
+        system_running = False
+        continue
+    cpu_power = 65 W
+    gpu_power = 150 W
+    power = generate_heat(cpu_power, gpu_power)
+    if power == 0 W:
+        log_error(log_file, "Heat generation failed: System halting")
+        system_running = False
+        continue
+    total_load = adjust_load_for_self_sufficiency(power, storage_level)
+    cpu_power = (total_load - (3.05 if fan_active else 2.55)) * 0.28
+    gpu_power = (total_load - (3.05 if fan_active else 2.55)) * 0.72
+    cpu_power = min(cpu_power, 230 W)
+    gpu_power = min(gpu_power, 600 W)
+    power = generate_heat(cpu_power, gpu_power)
+    if power == 0 W:
+        log_error(log_file, "Heat generation failed: System halting")
+        system_running = False
+        continue
+    excess = distribute_power(power, total_load)
+    if excess == 0 W and storage_level <= 0 Wh and not psu_ac_mode:
+        log_status(log_file, "Storage at 0 Wh: Idling to recharge")
+        total_load = 218.05 W if not fan_active else 218.55 W
+        cpu_power = 65 W
+        gpu_power = 150 W
+        power = generate_heat(cpu_power, gpu_power)
+        excess = distribute_power(power, total_load)
+        system_running = True
+    if excess >= 0 W:
+        if storage_level >= 1008 Wh:
+            print("System self-sufficient: Excess power = ", excess, "W dissipated, Storage = ", storage_level, "Wh")
+        else:
+            print("System self-sufficient: Excess power = ", excess, "W charging, Storage = ", storage_level, "Wh")
+    else:
+        print("System not self-sufficient: Deficit = ", excess, "W, Storage = ", storage_level, "Wh")
+    psu_ac_mode = False
+    sleep(1)
