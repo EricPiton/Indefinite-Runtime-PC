@@ -1,0 +1,262 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# System constants (tuned for ~1569.14 W max load)
+WASTE_HEAT_SERVER = 7475  # W, server context
+WASTE_HEAT_HOME = 1150    # W, home context
+TEG_EFFICIENCY = 0.15     # 15% skutterudite TEG
+REGULATOR_EFFICIENCY = 0.99
+POINT_LOSS = 0.985        # 1.5% heat loss
+BREAKER_EFFICIENCY = 0.94
+HEAT_TO_TEG = 0.95        # 95% heat transfer
+HEAT_CARRYOVER = 0.1      # 10% carryover
+FLOW_BOOST = 1.35         # 35% flow boost
+COOLING_PENALTY = 0.97    # 3% Mylar penalty
+SOLAR_POWER = 190         # W, 1 m² panel
+STORAGE_CAPACITY = 1008   # Wh, LiFePO4 battery
+MIN_FLOW_THRESHOLD = 0.1  # Min ferrofluid flow
+MIN_TEG_HEAT = 100        # W, min TEG heat
+MASS_PER_UNIT = 10        # kg
+COST_PER_UNIT = 3550      # $
+COST_PER_10_UNITS = 31000 # $
+
+# Load cases (original + Spaceborne/Starlink)
+LOAD_CASES = [
+    {"name": "Max Load", "cpu_power": 230, "gpu_power": 600, "waste_heat": WASTE_HEAT_SERVER, "load": 832.35},
+    {"name": "Idle Load", "cpu_power": 65, "gpu_power": 150, "waste_heat": WASTE_HEAT_SERVER, "load": 218.05},
+    {"name": "Low-Power Mode", "cpu_power": 40, "gpu_power": 80, "waste_heat": WASTE_HEAT_HOME, "load": 124.05},
+    {"name": "Spaceborne Compute", "cpu_power": 300, "gpu_power": 700, "waste_heat": WASTE_HEAT_SERVER, "load": 1000.0},
+    {"name": "Starlink Compute", "cpu_power": 50, "gpu_power": 100, "waste_heat": WASTE_HEAT_HOME, "load": 150.0}
+]
+
+# Comparison metrics for Spaceborne/Starlink
+COMPARISON_SYSTEMS = {
+    "Spaceborne": {"power": 1000, "mass": 150, "cost_per_watt": 2500, "efficiency": 0.25, "reliability": "High (Radiation-Hardened)"},
+    "Starlink": {"power": 150, "mass": 260, "cost_per_watt": 750, "efficiency": 0.32, "reliability": "Moderate (Radiation-Tolerant)"}
+}
+
+# Global state
+storage_level = STORAGE_CAPACITY
+system_status = "Operational"
+
+def compute_teg_power(point_heat, num_tegs, flow_rate):
+    """Calculate TEG power with fault checking."""
+    global system_status
+    if flow_rate < MIN_FLOW_THRESHOLD:
+        system_status = "Fault: Low Ferrofluid Flow"
+        return 0
+    if point_heat < MIN_TEG_HEAT:
+        return 0
+    teg_power = point_heat * POINT_LOSS * HEAT_TO_TEG * TEG_EFFICIENCY * REGULATOR_EFFICIENCY * COOLING_PENALTY * num_tegs
+    if teg_power <= 0:
+        system_status = "Fault: TEG Failure"
+        return 0
+    return teg_power
+
+def simulate_system(cpu_power, gpu_power, waste_heat, load, storage_level):
+    """Simulate HTSPS for a load case."""
+    global system_status
+    system_status = "Operational"
+    flow_rate = FLOW_BOOST
+
+    # Fault recovery
+    if system_status.startswith("Fault"):
+        flow_rate = min(FLOW_BOOST + 0.1, 1.5)
+
+    # Heat inputs
+    cpu_heat = cpu_power * 1.2
+    gpu_heat = gpu_power * 1.2
+    total_heat = cpu_heat + gpu_heat + waste_heat
+
+    # Point 1: CPU + Waste Heat, Three TEGs
+    point1_heat = (cpu_heat + waste_heat) * flow_rate
+    teg_power1 = compute_teg_power(point1_heat, 3, flow_rate)
+    carryover = point1_heat * HEAT_CARRYOVER
+
+    # Point 2: Before GPU, Single TEG
+    point2_heat = carryover * POINT_LOSS
+    teg_power2 = compute_teg_power(point2_heat, 1, flow_rate)
+    carryover = point2_heat * HEAT_CARRYOVER
+
+    # Point 3: After GPU, Three TEGs
+    point3_heat = (carryover * POINT_LOSS + gpu_heat)
+    teg_power3 = compute_teg_power(point3_heat, 3, flow_rate)
+    carryover = point3_heat * HEAT_CARRYOVER
+
+    # Point 4: End Loop, Single TEG
+    point4_heat = carryover * POINT_LOSS
+    teg_power4 = compute_teg_power(point4_heat, 1, flow_rate)
+    waste_heat_out = point4_heat * HEAT_CARRYOVER
+
+    # Total power
+    total_teg_power = teg_power1 + teg_power2 + teg_power3 + teg_power4
+    breaker_output = total_teg_power * BREAKER_EFFICIENCY
+
+    # Solar charging
+    solar_input = SOLAR_POWER / 3600
+    new_storage_level = min(STORAGE_CAPACITY, storage_level + solar_input)
+
+    # Battery management
+    excess = breaker_output - load
+    if excess > 0 and new_storage_level < STORAGE_CAPACITY:
+        storage_charge = min(excess / 3600, STORAGE_CAPACITY - new_storage_level)
+        new_storage_level += storage_charge
+    elif excess < 0 and new_storage_level > 0:
+        storage_discharge = min(-excess / 3600, new_storage_level)
+        new_storage_level -= storage_discharge
+        excess += storage_discharge * 3600
+
+    # Thermal management
+    cpu_temp = 85.5 if load >= 832.35 else 30
+    gpu_temp = 85.5 if load >= 832.35 else 35
+
+    # Efficiency
+    efficiency = (total_teg_power / total_heat) * 100 if total_heat > 0 else 0
+
+    return {
+        "total_heat": total_heat, "breaker_output": breaker_output, "excess": excess,
+        "storage_level": new_storage_level, "cpu_temp": cpu_temp, "gpu_temp": gpu_temp,
+        "efficiency": efficiency, "system_status": system_status
+    }
+
+def scale_system(num_units, load_case, storage_level):
+    """Simulate multiple units."""
+    total_breaker_output = 0
+    total_excess = 0
+    total_storage_level = storage_level * num_units
+    for _ in range(num_units):
+        result = simulate_system(
+            load_case["cpu_power"], load_case["gpu_power"],
+            load_case["waste_heat"] / num_units, load_case["load"], storage_level
+        )
+        total_breaker_output += result["breaker_output"]
+        total_excess += result["excess"]
+        total_storage_level = min(STORAGE_CAPACITY * num_units, total_storage_level + result["storage_level"] / num_units)
+    return {
+        "total_breaker_output": total_breaker_output,
+        "total_excess": total_excess,
+        "total_storage_level": total_storage_level,
+        "mass": num_units * MASS_PER_UNIT,
+        "cost": COST_PER_10_UNITS if num_units == 10 else num_units * COST_PER_UNIT
+    }
+
+def compare_systems(results, scaled_results):
+    """Compare HTSPS to Spaceborne/Starlink."""
+    comparison_data = []
+    for load_case in LOAD_CASES:
+        htsps_result = results[load_case["name"]]
+        scaled_result = scaled_results[load_case["name"]]
+        system_name = load_case["name"]
+        if "Spaceborne" in system_name:
+            ref_system = "Spaceborne"
+        elif "Starlink" in system_name:
+            ref_system = "Starlink"
+        else:
+            continue
+
+        ref = COMPARISON_SYSTEMS[ref_system]
+        comparison_data.append({
+            "System": system_name,
+            "HTSPS Power (W)": htsps_result["breaker_output"],
+            "Ref Power (W)": ref["power"],
+            "HTSPS Excess (W)": htsps_result["excess"],
+            "HTSPS Efficiency (%)": htsps_result["efficiency"],
+            "Ref Efficiency (%)": ref["efficiency"] * 100,
+            "HTSPS Mass (kg)": MASS_PER_UNIT,
+            "Ref Mass (kg)": ref["mass"],
+            "HTSPS Cost ($)": COST_PER_UNIT,
+            "Ref Cost ($)": ref["cost_per_watt"] * ref["power"],
+            "HTSPS Reliability": htsps_result["system_status"],
+            "Ref Reliability": ref["reliability"],
+            "Scaled Power (10 units, W)": scaled_result["total_breaker_output"],
+            "Scaled Mass (kg)": scaled_result["mass"],
+            "Scaled Cost ($)": scaled_result["cost"]
+        })
+    return comparison_data
+
+def visualize_comparison(comparison_data):
+    """Visualize comparison results."""
+    df = pd.DataFrame(comparison_data)
+    systems = df["System"]
+    x = np.arange(len(systems))
+
+    # Power comparison
+    plt.figure(figsize=(10, 6))
+    plt.bar(x - 0.2, df["HTSPS Power (W)"], 0.4, label="HTSPS Power")
+    plt.bar(x + 0.2, df["Ref Power (W)"], 0.4, label="Reference Power")
+    plt.xticks(x, systems)
+    plt.ylabel("Power (W)")
+    plt.title("Power Output Comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("power_comparison.png")
+    plt.close()
+
+    # Mass comparison
+    plt.figure(figsize=(10, 6))
+    plt.bar(x - 0.2, df["HTSPS Mass (kg)"], 0.4, label="HTSPS Mass")
+    plt.bar(x + 0.2, df["Ref Mass (kg)"], 0.4, label="Reference Mass")
+    plt.xticks(x, systems)
+    plt.ylabel("Mass (kg)")
+    plt.title("Mass Comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("mass_comparison.png")
+    plt.close()
+
+    # Cost comparison
+    plt.figure(figsize=(10, 6))
+    plt.bar(x - 0.2, df["HTSPS Cost ($)"], 0.4, label="HTSPS Cost")
+    plt.bar(x + 0.2, df["Ref Cost ($)"], 0.4, label="Reference Cost")
+    plt.xticks(x, systems)
+    plt.ylabel("Cost ($)")
+    plt.title("Cost Comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("cost_comparison.png")
+    plt.close()
+
+# Main simulation
+results = {}
+scaled_results = {}
+output_data = []
+storage_level = STORAGE_CAPACITY
+
+for load_case in LOAD_CASES:
+    result = simulate_system(
+        load_case["cpu_power"], load_case["gpu_power"],
+        load_case["waste_heat"], load_case["load"], storage_level
+    )
+    storage_level = result["storage_level"]
+    results[load_case["name"]] = result
+    scaled_result = scale_system(10, load_case, storage_level)
+    scaled_results[load_case["name"]] = scaled_result
+
+    output_data.append({
+        "Load Case": load_case["name"], "System Status": result["system_status"],
+        "Breaker Output (W)": result["breaker_output"], "Load (W)": load_case["load"],
+        "Excess/Deficit (W)": result["excess"], "Efficiency (%)": result["efficiency"],
+        "Storage Level (Wh)": result["storage_level"], "Mass (kg)": MASS_PER_UNIT,
+        "Cost ($)": COST_PER_UNIT
+    })
+
+# Compare with Spaceborne/Starlink
+comparison_data = compare_systems(results, scaled_results)
+pd.DataFrame(comparison_data).to_csv("comparison_results.csv", index=False)
+visualize_comparison(comparison_data)
+
+# Print results
+for load_case in LOAD_CASES:
+    result = results[load_case["name"]]
+    scaled_result = scaled_results[load_case["name"]]
+    print(f"\nLoad Case: {load_case['name']}")
+    print(f"System Status: {result['system_status']}")
+    print(f"Breaker Output: {result['breaker_output']:.2f} W")
+    print(f"Load: {load_case['load']:.2f} W")
+    print(f"Excess/Deficit: {result['excess']:.2f} W")
+    print(f"Efficiency: {result['efficiency']:.2f}%")
+    print(f"Storage Level: {result['storage_level']:.2f} Wh")
+    print(f"Mass: {MASS_PER_UNIT} kg")
+    print(f"Cost: ${COST_PER_UNIT}")
+    print(f"Scaled (10 Units): {scaled_result['total_breaker_output']:.2f} W, {scaled_result['mass']} kg, ${scaled_result['cost']}")
