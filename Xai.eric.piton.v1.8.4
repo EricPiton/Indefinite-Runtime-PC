@@ -1,0 +1,362 @@
+// Constants
+WASTE_HEAT = 0 W            // No external heat source
+SOLAR_POWER = 197.22 W      // 1.038 m² GaAs panel, 32% efficiency, 98% MPPT
+STORAGE_CAP = 1008 Wh       // LiFePO4 battery
+REGULATOR_EFF = 0.995       // TI LM5176-Q1 efficiency
+POINT_LOSS = 0.985          // 1.5% heat loss per point
+BREAKER_EFF = 0.96          // TI TPS546B24A efficiency
+HEAT_TO_TEG = 0.95          // 95% heat to TEGs
+HEAT_CARRYOVER = 0.1        // 10% heat carryover
+FLOW_BOOST = 1.35           // Target ferrofluid flow boost
+COOLING_EFF = 0.995         // Noctua NH-D15S heat pipes
+MIN_FLOW = 0.1              // Minimum ferrofluid flow (Ferrotec EFH1)
+MIN_TEG_HEAT = 100 W        // Minimum TEG heat input
+MAGNET_STRENGTH = 0.5 T     // N52 magnets, 0.2 T N45 backup
+MAGNET_MIN_STRENGTH = 0.45 T  // 90% of 0.5 T for primary
+MASS = 10 kg                // Per unit
+COST = $14484               // Total system cost
+BOOT_ENERGY = 0.5 Wh        // Minimum for boot
+MIN_STORAGE_THRESHOLD = 201.6 Wh  // 20% of 1008 Wh
+FAN_POWER = 0.5 W           // Noctua NF-A12x25, activates if waste heat > 50 W
+CHARGE_POWER_MIN = 0.3 W    // TI BQ24650
+CHARGE_POWER_MAX = 0.8 W    // TI BQ24650
+TEG_CONTROL_POWER = 0.5 W   // TEG management (includes charger idle)
+MB_POWER = 0.8 W            // Motherboard (ASRock A620I)
+RAM_POWER = 0.5 W           // Kingston Fury DDR5
+SSD_POWER = 0.4 W           // Samsung 990 Pro
+FLOW_REGULATOR_POWER = 0.5 W  // Lee VHS Micro-Dispensing Valve, per unit
+
+// TEG Module Configuration
+TEG_CONFIG = [
+    {point: 1, num_tegs: 3, efficiency: 0.32},  // Point 1: 3 TEGs, 32% efficiency
+    {point: 2, num_tegs: 1, efficiency: 0.32},  // Point 2: 1 TEG
+    {point: 3, num_tegs: 3, efficiency: 0.32},  // Point 3: 3 TEGs
+    {point: 4, num_tegs: 1, efficiency: 0.32}   // Point 4: 1 TEG
+]
+
+// Component Configuration
+COMPONENTS = [
+    {cpu: 5-50 W, name: "AMD Ryzen", temp: 25 °C},
+    {gpu: 2-600 W, name: "Radeon", temp: 25 °C},
+    {mb: 0.8 W, name: "ASRock A620I"},
+    {ram: 0.5 W, name: "Kingston Fury DDR5"},
+    {ssd: 0.4 W, name: "Samsung 990 Pro"},
+    {fan: 0-0.5 W, name: "Noctua NF-A12x25", active: False},
+    {charge: 0.3-0.8 W, name: "TI BQ24650"},
+    {teg_control: 0.5 W, name: "TEG Control"},
+    {flow_reg1: 0.5 W, name: "Lee VHS Valve Point 1"},
+    {flow_reg2: 0.5 W, name: "Lee VHS Valve Point 2"},
+    {flow_reg3: 0.5 W, name: "Lee VHS Valve Point 3"},
+    {flow_reg4: 0.5 W, name: "Lee VHS Valve Point 4"}
+]
+
+// Load Cases
+LOAD_MODES = [
+    {mode: "idle", total: 52 W, cpu: 5 W, gpu: 2 W, other: MB_POWER + RAM_POWER + SSD_POWER + CHARGE_POWER_MIN + TEG_CONTROL_POWER + 4 * FLOW_REGULATOR_POWER},
+    {mode: "mid", total: 302 W, cpu: 25 W, gpu: 271.95 W, other: MB_POWER + RAM_POWER + SSD_POWER + CHARGE_POWER_MIN + TEG_CONTROL_POWER + 4 * FLOW_REGULATOR_POWER},
+    {mode: "max", total: 654.35 W, cpu: 50 W, gpu: 600 W, other: MB_POWER + RAM_POWER + SSD_POWER + CHARGE_POWER_MAX + TEG_CONTROL_POWER + 4 * FLOW_REGULATOR_POWER}
+]
+
+// Initialize
+storage_level = STORAGE_CAP
+system_status = "Operational"
+magnet_set = "primary"      // N52 (0.5 T) or N45 (0.2 T)
+magnet_charger_active = False
+fan_active = False
+log_file = "system_status.log"
+system_running = True
+
+// Function: Log Status
+FUNCTION log_status(file, message)
+    WRITE file, TIMESTAMP + ": " + message
+END
+
+// Function: Check Boot
+FUNCTION check_boot()
+    IF storage_level < BOOT_ENERGY THEN
+        log_status(log_file, "Storage below 0.5 Wh: Booting with PSU AC mode")
+        system_status = "Warning: PSU AC Boot"
+        RETURN draw_ac_power(voltage=12 V, efficiency=0.94)  // Seasonic Prime TX-1600
+    RETURN 0 W
+END
+
+// Function: Manage Magnet Charger/Discharger
+FUNCTION manage_magnet_charger()
+    current_strength = read_gaussmeter("Gaussmeter", magnet_set)
+    IF magnet_set = "primary" AND current_strength < MAGNET_MIN_STRENGTH THEN
+        magnet_charger_active = True
+        charge_magnet("Lake Shore Model 648 Coil", target=0.5 T, power=10 W)
+        log_status(log_file, "Charging primary magnet: Strength=" + current_strength + " T")
+        RETURN True
+    IF magnet_set = "backup" AND current_strength < 0.18 T THEN
+        magnet_charger_active = True
+        charge_magnet("Lake Shore Model 648 Coil", target=0.2 T, power=10 W)
+        log_status(log_file, "Charging backup magnet: Strength=" + current_strength + " T")
+        RETURN True
+    IF system_status contains "Maintenance" THEN
+        magnet_charger_active = True
+        discharge_magnet("Lake Shore Model 648 Coil", power=10 W)
+        log_status(log_file, "Discharging magnet for maintenance")
+        RETURN True
+    magnet_charger_active = False
+    RETURN False
+END
+
+// Function: Regulate Ferrofluid Flow
+FUNCTION regulate_ferrofluid_flow(target_flow, point)
+    flow_rate = read_flow_sensor("Sensirion SLF3s-0600F", point)
+    IF flow_rate < MIN_FLOW THEN
+        system_status = "Fault: Low Ferrofluid Flow at Point " + point
+        log_status(log_file, "Low flow at point " + point + ": " + flow_rate)
+        RETURN MIN_FLOW
+    adjust_valve("Lee VHS Micro-Dispensing Valve", point, target=target_flow, power=FLOW_REGULATOR_POWER)
+    new_flow = read_flow_sensor("Sensirion SLF3s-0600F", point)
+    log_status(log_file, "Flow regulated at point " + point + ": " + new_flow)
+    RETURN new_flow
+END
+
+// Function: Monitor Ferrofluid Flow
+FUNCTION monitor_ferrofluid_flow()
+    IF manage_magnet_charger() THEN
+        log_status(log_file, "Magnet charger active, verifying flow")
+    FOR EACH point IN TEG_CONFIG
+        flow_rate = regulate_ferrofluid_flow(FLOW_BOOST, point.point)
+        IF flow_rate < MIN_FLOW THEN
+            magnet_set = "backup"
+            MAGNET_STRENGTH = 0.2 T
+            log_status(log_file, "Ferrofluid flow low: Switching to backup magnets")
+            RETURN False
+    RETURN True
+END
+
+// Function: Monitor Temperatures
+FUNCTION monitor_temperatures()
+    cpu_temp = read_temp_sensor("TI TMP117", "CPU")
+    gpu_temp = read_temp_sensor("TI TMP117", "GPU")
+    teg_hot = read_temp_sensor("TI TMP117", "TEG_hot")
+    magnet_temp = read_temp_sensor("TI TMP117", "Magnet")
+    COMPONENTS.cpu.temp = cpu_temp
+    COMPONENTS.gpu.temp = gpu_temp
+    IF cpu_temp > 95 OR gpu_temp > 95 THEN
+        system_status = "Fault: Thermal Limit"
+        log_status(log_file, "Thermal limit exceeded: CPU=" + cpu_temp + "°C, GPU=" + gpu_temp + "°C")
+        RETURN False
+    IF magnet_temp > 70 THEN
+        magnet_set = "backup"
+        MAGNET_STRENGTH = 0.2 T
+        system_status = "Warning: Backup Magnets"
+        log_status(log_file, "Magnet temp " + magnet_temp + "°C: Switching to backup")
+    IF teg_hot < MIN_TEG_HEAT THEN
+        system_status = "Fault: Low TEG Heat"
+        log_status(log_file, "TEG heat input low: " + teg_hot + " W")
+        RETURN False
+    RETURN True
+END
+
+// Function: Monitor TEG Health
+FUNCTION check_teg_health()
+    FOR EACH teg IN TEG_CONFIG
+        voltage = read_voltage("Analog Devices AD5940", teg)
+        IF voltage < 12 THEN
+            system_status = "Fault: TEG Failure at Point " + teg.point
+            log_status(log_file, "TEG failure at point " + teg.point + ": Voltage=" + voltage + " V")
+            RETURN False
+    RETURN True
+END
+
+// Function: Monitor Battery
+FUNCTION monitor_battery()
+    soc = read_fuel_gauge("TI BQ34Z100-G1")
+    storage_level = soc * STORAGE_CAP
+    IF soc < 0.2 THEN
+        system_status = "Warning: Low Battery"
+        log_status(log_file, "Battery SoC < 20%: " + storage_level + " Wh")
+    IF capacity < 0.8 * STORAGE_CAP THEN
+        log_status(log_file, "Battery degradation detected: Capacity=" + capacity + " Wh")
+    RETURN storage_level
+END
+
+// Function: Manage Cooling
+FUNCTION manage_cooling(waste_heat)
+    IF waste_heat > 50 THEN
+        fan_active = True
+        COMPONENTS.fan.power = FAN_POWER
+        COMPONENTS.fan.active = True
+        log_status(log_file, "Fan activated: Waste heat=" + waste_heat + " W")
+    ELSE
+        fan_active = False
+        COMPONENTS.fan.power = 0 W
+        COMPONENTS.fan.active = False
+        log_status(log_file, "Fan deactivated: Waste heat=" + waste_heat + " W")
+    IF NOT cool(waste_heat, method="Noctua NH-D15S, heat pipes, fan=" + fan_active) THEN
+        system_status = "Fault: Cooling Failure"
+        log_status(log_file, "Cooling failure: Waste heat=" + waste_heat + " W")
+        RETURN False
+    RETURN True
+END
+
+// Function: Compute TEG Power
+FUNCTION compute_teg_power(point_heat, num_tegs, teg_efficiency, flow_rate)
+    IF flow_rate < MIN_FLOW THEN
+        system_status = "Fault: Low Ferrofluid Flow"
+        log_status(log_file, "TEG offline: Low flow rate=" + flow_rate)
+        RETURN 0
+    IF point_heat < MIN_TEG_HEAT THEN
+        log_status(log_file, "TEG offline: Low heat=" + point_heat + " W")
+        RETURN 0
+    teg_power = point_heat * POINT_LOSS * HEAT_TO_TEG * teg_efficiency * REGULATOR_EFF * COOLING_EFF * num_tegs
+    IF teg_power <= 0 THEN
+        system_status = "Fault: TEG Failure"
+        log_status(log_file, "TEG failure: Power=" + teg_power + " W")
+        RETURN 0
+    teg_power = regulate(teg_power, voltage=12 V, controller="TI LM5176-Q1")
+    log_status(log_file, "TEG power at point: " + teg_power + " W")
+    RETURN teg_power
+END
+
+// Function: Adjust Load for Self-Sufficiency
+FUNCTION adjust_load_for_self_sufficiency(breaker_output, storage_level)
+    total_load_min = 52 W
+    total_load_mid = 302 W
+    total_load_max = 654.35 W
+    IF storage_level <= MIN_STORAGE_THRESHOLD THEN
+        log_status(log_file, "Storage below 20% (" + storage_level + " Wh): Forcing idle")
+        LOAD_MODES[0].total = total_load_min + (FAN_POWER IF fan_active ELSE 0)
+        RETURN LOAD_MODES[0]
+    IF breaker_output >= total_load_max THEN
+        log_status(log_file, "Full load: " + total_load_max + " W")
+        LOAD_MODES[2].total = total_load_max + (FAN_POWER IF fan_active ELSE 0)
+        RETURN LOAD_MODES[2]
+    IF breaker_output >= total_load_mid THEN
+        cpu_power = (total_load_mid - (MB_POWER + RAM_POWER + SSD_POWER + CHARGE_POWER_MIN + TEG_CONTROL_POWER + 4 * FLOW_REGULATOR_POWER)) * 0.67
+        gpu_power = (total_load_mid - (MB_POWER + RAM_POWER + SSD_POWER + CHARGE_POWER_MIN + TEG_CONTROL_POWER + 4 * FLOW_REGULATOR_POWER)) * 0.33
+        cpu_power = MIN(cpu_power, 50 W)
+        gpu_power = MIN(gpu_power, 600 W)
+        total_load = cpu_power + gpu_power + MB_POWER + RAM_POWER + SSD_POWER + CHARGE_POWER_MIN + TEG_CONTROL_POWER + 4 * FLOW_REGULATOR_POWER
+        LOAD_MODES[1].total = total_load + (FAN_POWER IF fan_active ELSE 0)
+        log_status(log_file, "Mid load: " + total_load + " W, CPU=" + cpu_power + " W, GPU=" + gpu_power + " W")
+        RETURN LOAD_MODES[1]
+    log_status(log_file, "Idle load: " + total_load_min + " W")
+    LOAD_MODES[0].total = total_load_min + (FAN_POWER IF fan_active ELSE 0)
+    RETURN LOAD_MODES[0]
+END
+
+// Function: Distribute Power to Components
+FUNCTION distribute_power(power, load)
+    breaker_output = power * BREAKER_EFF
+    total_load = load.total + (FAN_POWER IF fan_active ELSE 0)
+    IF breaker_output < total_load THEN
+        deficit = total_load - breaker_output
+        IF storage_level > 0 THEN
+            discharge = MIN(deficit / 3600, storage_level)
+            storage_level = storage_level - discharge
+            breaker_output = total_load
+            log_status(log_file, "Discharging storage: " + deficit + " W, Level=" + storage_level + " Wh")
+        ELSE
+            log_status(log_file, "Storage depleted: Throttling to idle")
+            RETURN 0 W
+    FOR EACH comp IN COMPONENTS
+        IF comp.name = "AMD Ryzen" THEN
+            comp.power = load.cpu
+        ELSE IF comp.name = "Radeon" THEN
+            comp.power = load.gpu
+        ELSE IF comp.name = "TI BQ24650" THEN
+            comp.power = IF total_load = LOAD_MODES[2].total THEN CHARGE_POWER_MAX ELSE CHARGE_POWER_MIN
+        ELSE
+            comp.power = comp.power  // MB, RAM, SSD, TEG control, flow regulators
+        distribute_to_component(breaker_output, comp, voltage=12 V, regulator="TI TPS546B24A")
+    excess = breaker_output - total_load
+    IF excess > 0 AND storage_level < STORAGE_CAP THEN
+        charge = MIN(excess / 3600, STORAGE_CAP - storage_level)
+        storage_level = storage_level + charge
+        log_status(log_file, "Charging storage: " + excess + " W, Level=" + storage_level + " Wh")
+    ELSE IF excess > 0 THEN
+        dissipate_excess(excess, discharger="Ohmite TGHG 100 W")
+        log_status(log_file, "Dissipating excess: " + excess + " W")
+    RETURN excess
+END
+
+// Function: Simulate HTSPS
+FUNCTION simulate_htsps(load_mode, storage_level)
+    system_status = "Operational"
+    IF NOT monitor_ferrofluid_flow() OR NOT monitor_temperatures() OR NOT check_teg_health() THEN
+        system_running = False
+        log_status(log_file, "System fault: Halting")
+        RETURN {breaker_output: 0, excess: 0, new_storage_level: storage_level, efficiency: 0, cpu_temp: 25, gpu_temp: 25, system_status}
+    storage_level = monitor_battery()
+    flow_rate = FLOW_BOOST
+    IF system_status contains "Fault" THEN
+        flow_rate = MIN(FLOW_BOOST + 0.1, 1.5)
+        log_status(log_file, "Fault recovery: Adjusting flow rate to " + flow_rate)
+    cpu_power = load_mode.cpu
+    gpu_power = load_mode.gpu
+    cpu_heat = cpu_power * 1.2
+    gpu_heat = gpu_power * 1.2
+    total_heat = cpu_heat + gpu_heat + WASTE_HEAT
+    point1_heat = (cpu_heat + WASTE_HEAT) * flow_rate
+    teg_power1 = compute_teg_power(point1_heat, TEG_CONFIG[1].num_tegs, TEG_CONFIG[1].efficiency, flow_rate)
+    carryover = point1_heat * HEAT_CARRYOVER
+    point2_heat = carryover * POINT_LOSS
+    teg_power2 = compute_teg_power(point2_heat, TEG_CONFIG[2].num_tegs, TEG_CONFIG[2].efficiency, flow_rate)
+    carryover = point2_heat * HEAT_CARRYOVER
+    point3_heat = (carryover * POINT_LOSS + gpu_heat)
+    teg_power3 = compute_teg_power(point3_heat, TEG_CONFIG[3].num_tegs, TEG_CONFIG[3].efficiency, flow_rate)
+    carryover = point3_heat * HEAT_CARRYOVER
+    point4_heat = carryover * POINT_LOSS
+    teg_power4 = compute_teg_power(point4_heat, TEG_CONFIG[4].num_tegs, TEG_CONFIG[4].efficiency, flow_rate)
+    waste_heat_out = point4_heat * HEAT_CARRYOVER
+    IF NOT manage_cooling(waste_heat_out) THEN
+        system_running = False
+        log_status(log_file, "Cooling failure: Halting")
+        RETURN {breaker_output: 0, excess: 0, new_storage_level: storage_level, efficiency: 0, cpu_temp: 25, gpu_temp: 25, system_status}
+    total_teg_power = teg_power1 + teg_power2 + teg_power3 + teg_power4
+    breaker_output = total_teg_power * BREAKER_EFF
+    solar_input = (SOLAR_POWER * 0.98) / 3600  // Victron SmartSolar MPPT
+    new_storage_level = MIN(STORAGE_CAP, storage_level + solar_input)
+    load_mode = adjust_load_for_self_sufficiency(breaker_output, new_storage_level)
+    excess = distribute_power(total_teg_power, load_mode)
+    cpu_temp = (load_mode.total >= 654.35) ? 85.5 : (load_mode.total >= 302 ? 60 : 30)
+    gpu_temp = (load_mode.total >= 654.35) ? 85.5 : (load_mode.total >= 302 ? 65 : 35)
+    efficiency = (total_heat > 0) ? (total_teg_power / total_heat) * 100 : 0
+    log_status(log_file, "Mode: " + load_mode.mode + ", Breaker Output: " + breaker_output + " W, Excess: " + excess + " W, Storage: " + new_storage_level + " Wh, Efficiency: " + efficiency + "%")
+    RETURN {breaker_output, excess, new_storage_level, efficiency, cpu_temp, gpu_temp, system_status}
+END
+
+// Function: Scale HTSPS
+FUNCTION scale_htsps(num_units, load_mode, storage_level)
+    total_breaker_output = 0
+    total_excess = 0
+    total_storage_level = storage_level * num_units
+    FOR i = 1 TO num_units
+        result = simulate_htsps(load_mode, storage_level)
+        total_breaker_output = total_breaker_output + result.breaker_output
+        total_excess = total_excess + result.excess
+        total_storage_level = MIN(STORAGE_CAP * num_units, total_storage_level + result.new_storage_level / num_units)
+    END
+    RETURN {total_breaker_output, total_excess, total_storage_level, mass: num_units * MASS, cost: num_units * COST}
+END
+
+// Main Operation
+WHILE system_running
+    boot_power = check_boot()
+    IF boot_power > 0 THEN
+        distribute_to_components(boot_power, COMPONENTS, voltage=12 V, regulator="TI TPS546B24A")
+        log_status(log_file, "Booting with PSU AC: " + boot_power + " W")
+    initial_load = LOAD_MODES[0]  // Start in idle
+    storage_level = monitor_battery()
+    result = simulate_htsps(initial_load, storage_level)
+    storage_level = result.new_storage_level
+    IF result.excess >= 0 THEN
+        IF storage_level >= STORAGE_CAP THEN
+            PRINT "System self-sufficient: Excess power = ", result.excess, " W dissipated, Storage = ", storage_level, " Wh"
+        ELSE
+            PRINT "System self-sufficient: Excess power = ", result.excess, " W charging, Storage = ", storage_level, " Wh"
+    ELSE
+        PRINT "System not self-sufficient: Deficit = ", result.excess, " W, Storage = ", storage_level, " Wh"
+    scaled_result = scale_htsps(1, result.load_mode, storage_level)  // Single unit
+    log_status(log_file, "Scaled Output: " + scaled_result.total_breaker_output + " W")
+    IF result.system_status contains "Fault" THEN
+        system_running = False
+        log_status(log_file, "System halted due to fault")
+    SLEEP(1)
+END
