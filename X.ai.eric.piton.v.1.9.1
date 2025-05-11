@@ -1,0 +1,537 @@
+// Hybrid Thermal-Solar Power System (HTSPS) by Eric Joseph Piton
+// Refined for terrestrial applications (server and home contexts)
+// Fully self-sufficient with indefinite runtime post-boot, generating excess power
+// Components: SankoPower LiFePO4 battery, AMD Ryzen 9 7950X CPU, NVIDIA RTX 4090 GPU,
+//             64 GB DDR5 RAM, 2 TB NVMe SSD, ASUS ROG Crosshair X670E motherboard,
+//             Ferrotec EFH1 ferrofluid, N45 magnets with charger/discharger,
+//             3 m² silicon PV panel, TEG6-242 TEGs, liquid cooling
+// Simulation cycle: 80 ms (100 ms fallback for fault tolerance)
+
+// CONSTANTS
+// Power Sources
+CONST WASTE_HEAT_SERVER = 7475 W          // Data center-grade waste heat (server context)
+CONST WASTE_HEAT_HOME = 1150 W            // Residential waste heat (home context)
+CONST SOLAR_POWER = 570 W                 // 3 m² silicon PV panel, 25% efficiency, 98% MPPT
+CONST SOLAR_REFLECTION_EFF = 0.98         // MPPT efficiency for solar input
+CONST SOLAR_INPUT_FACTOR = 1.0            // Dynamically adjusted (0.3–1.0)
+CONST STORAGE_CAP = 5120 Wh               // SankoPower LiFePO4 51.2V/100Ah, 90% usable (4608 Wh)
+CONST THROTTLE_STORAGE_THRESHOLD = 1382.4 Wh  // 30% of usable capacity
+CONST MIN_STORAGE_THRESHOLD = 921.6 Wh    // 20% of usable capacity
+CONST BOOT_ENERGY = 0.5 Wh                // Energy to boot system
+CONST IDLE_LOAD = 52 W                    // Idle load for low-power scenarios
+
+// Component Power Consumption
+CONST CPU_POWER_MAX = 230 W               // AMD Ryzen 9 7950X max power
+CONST GPU_POWER_MAX = 600 W               // NVIDIA RTX 4090 max power
+CONST MEMORY_POWER = 20 W                 // 64 GB DDR5 RAM (4x 16 GB, 5 W each)
+CONST SSD_POWER = 10 W                    // 2 TB NVMe SSD (Samsung 990 Pro)
+CONST MOTHERBOARD_POWER = 25 W            // ASUS ROG Crosshair X670E
+CONST COOLING_POWER_MIN = 2 W             // Variable-speed liquid cooling (radiator + pump)
+CONST COOLING_POWER_MAX = 10 W            // Maximum cooling power
+CONST COOLING_ACTIVATION_THRESHOLD = 10 W // Cooling activates if waste_heat_out > 10 W
+
+// Efficiency and Losses
+CONST BREAKER_EFF = 0.98                  // Mean Well RSP-3000 PSU efficiency
+CONST REGULATOR_EFF = 0.99                // TI TPS7A88 voltage regulator efficiency
+CONST HEAT_TO_TEG = 0.96                  // 96% heat transfer to TEGs, magnet-assisted
+CONST POINT_LOSS = 0.99                   // 1% loss per heat transfer point
+CONST HEAT_CARRYOVER = 0.05               // 5% heat carryover to next point
+CONST COOLING_PENALTY = 0.995             // 0.5% penalty with liquid cooling at Point 4
+
+// Ferrofluid System
+CONST FLOW_BOOST = 1.5                    // 50% flow boost via N45 magnets
+CONST MIN_FLOW = 0.1                      // Minimum ferrofluid flow (Ferrotec EFH1)
+CONST MAGNET_STRENGTH_MAX = 0.4 T         // N45 neodymium magnet, max strength
+CONST MAGNET_STRENGTH_MIN = 0.08 T        // 20% of max for low heat
+CONST MAGNET_TEMP_MAX = 70 °C             // Magnet temperature limit
+CONST MAGNET_HEAT_PULL_EFF = 0.98         // 98% efficiency pulling heat to TEGs
+CONST MAGNET_FLOW_PUSH_EFF = 0.99         // 99% efficiency pushing ferrofluid
+CONST MAGNET_POWER = 0.4 W                // Power per N45 magnet
+CONST CHARGER_POWER = 1.0 W               // Magnet charger/discharger power per point
+CONST CHARGER_EFF = 0.95                  // Charger/discharger efficiency
+
+// TEG and Thermal
+CONST MIN_TEG_HEAT = 50 W                 // Minimum heat for TEGs
+CONST MAX_TEG_HEAT = 10000 W              // Maximum heat input for TEG
+CONST TEG_RECOVERY_THRESHOLD = 10 W       // Minimum TEG power for recovery
+CONST BATTERY_DEGRADATION_THRESHOLD = 4096 Wh  // 80% of nominal capacity
+CONST CPU_TEMP_MAX = 95 °C                // Max CPU temperature
+CONST GPU_TEMP_MAX = 150 °C               // Max GPU temperature (liquid-cooled)
+CONST MEMORY_TEMP_MAX = 85 °C             // Max DDR5 RAM temperature
+CONST SSD_TEMP_MAX = 70 °C                // Max NVMe SSD temperature
+CONST MOTHERBOARD_TEMP_MAX = 80 °C        // Max motherboard temperature
+
+// System Specs
+CONST MASS = 65 kg                        // System (15 kg) + battery (50 kg)
+CONST LOG_FILE = "system_status.log"      // Log file for system status
+CONST API_ENDPOINT = "https://x.ai/api"    // Real-time monitoring via xAI API
+
+// Component Configurations
+// TEG Configuration (Thermal-to-Electric Conversion)
+CONST TEG_CONFIG = [
+    {point: 1, num_tegs: 3, efficiency: 0.25, model: "TEG6-242"}, // CPU + waste heat
+    {point: 2, num_tegs: 2, efficiency: 0.25, model: "TEG6-242"}, // Carryover heat
+    {point: 3, num_tegs: 3, efficiency: 0.25, model: "TEG6-242"}, // GPU
+    {point: 4, num_tegs: 2, efficiency: 0.25, model: "TEG6-242"}  // Exhaust
+]
+
+// Magnet Configuration (Ferrofluid Flow and Heat Transfer)
+CONST MAGNET_CONFIG = [
+    {point: 1, strength: MAGNET_STRENGTH_MAX, temp: 25 °C, power: MAGNET_POWER, charger_active: False},
+    {point: 2, strength: MAGNET_STRENGTH_MAX, temp: 25 °C, power: MAGNET_POWER, charger_active: False},
+    {point: 3, strength: MAGNET_STRENGTH_MAX, temp: 25 °C, power: MAGNET_POWER, charger_active: False},
+    {point: 4, strength: MAGNET_STRENGTH_MAX, temp: 25 °C, power: MAGNET_POWER, charger_active: False}
+]
+
+// Load Cases (Operational Scenarios)
+CONST LOAD_CASES = [
+    {name: "Max Load", cpu_power: 230 W, gpu_power: 600 W, memory_power: 20 W, ssd_power: 10 W, motherboard_power: 25 W, waste_heat: WASTE_HEAT_SERVER, load: 885 W, context: "server"},
+    {name: "High-Load Server", cpu_power: 300 W, gpu_power: 700 W, memory_power: 20 W, ssd_power: 10 W, motherboard_power: 25 W, waste_heat: WASTE_HEAT_SERVER, load: 1055 W, context: "server"},
+    {name: "Starlink Compute", cpu_power: 50 W, gpu_power: 100 W, memory_power: 10 W, ssd_power: 5 W, motherboard_power: 15 W, waste_heat: WASTE_HEAT_HOME, load: 180 W, context: "home"},
+    {name: "Idle", cpu_power: 20 W, gpu_power: 10 W, memory_power: 5 W, ssd_power: 2 W, motherboard_power: 10 W, waste_heat: WASTE_HEAT_HOME, load: 47 W, context: "home"}
+]
+
+// Initialize System State
+VAR storage_level = STORAGE_CAP            // 5120 Wh
+VAR system_status = "Operational"
+VAR cpu_throttled = False
+VAR gpu_throttled = False
+VAR flow_rate = FLOW_BOOST                // Initial ferrofluid flow rate
+VAR system_running = True
+VAR booted = False
+VAR magnet_power_total = 4 * MAGNET_POWER  // 1.6 W (4 magnets)
+VAR charger_power_total = 0 W             // Magnet charger/discharger power
+VAR cooling_active = False
+VAR cooling_power = 0 W
+VAR flow_trend = 1.5                      // Track flow for predictive maintenance
+VAR battery_capacity = STORAGE_CAP        // 5120 Wh
+VAR component_temps = {cpu: 25 °C, gpu: 25 °C, memory: 25 °C, ssd: 25 °C, motherboard: 25 °C}
+
+// Component: SankoPower LiFePO4 Battery
+FUNCTION monitor_battery_health()
+    battery_capacity = read_fuel_gauge(sensor="TI BQ34Z100-G1")
+    IF battery_capacity < BATTERY_DEGRADATION_THRESHOLD THEN
+        log_warning(LOG_FILE, "Battery degradation: Capacity=" + battery_capacity + " Wh")
+        send_alert(API_ENDPOINT, "Battery capacity low: " + battery_capacity + " Wh")
+    END
+    RETURN battery_capacity
+END
+
+// Component: TEG6-242 Thermoelectric Generators
+FUNCTION compute_teg_power(point_heat, num_tegs, teg_efficiency, flow_rate, point, model)
+    IF flow_rate < MIN_FLOW THEN
+        log_error(LOG_FILE, "Low ferrofluid flow at point " + point)
+        system_status = "Fault: Low Flow"
+        RETURN 0
+    END
+    IF point_heat < MIN_TEG_HEAT THEN
+        log_warning(LOG_FILE, "Insufficient heat at point " + point + ": " + point_heat + " W")
+        RETURN 0
+    END
+    IF point_heat > MAX_TEG_HEAT THEN
+        log_warning(LOG_FILE, "Excessive heat at point " + point + ": " + point_heat + " W")
+        point_heat = MAX_TEG_HEAT
+    END
+    magnet = MAGNET_CONFIG[point - 1]
+    heat_to_teg = point_heat * MAGNET_HEAT_PULL_EFF
+    teg_power = heat_to_teg * POINT_LOSS * HEAT_TO_TEG * teg_efficiency * REGULATOR_EFF * COOLING_PENALTY * num_tegs
+    teg_health = check_teg_voltage(teg_power, sensor="Analog Devices AD5940")
+    IF NOT teg_health OR teg_power <= TEG_RECOVERY_THRESHOLD THEN
+        log_error(LOG_FILE, "TEG failure at point " + point + ", model=" + model)
+        system_status = "Fault: TEG Failure"
+        IF recover_from_fault("TEG Failure", point) THEN
+            RETURN teg_power * 0.5
+        END
+        RETURN 0
+    END
+    flow_push = MAGNET_FLOW_PUSH_EFF * flow_rate
+    log_status(LOG_FILE, model + " at point " + point + ": " + teg_power + " W, Flow Push=" + flow_push)
+    RETURN teg_power
+END
+
+// Component: N45 Neodymium Magnets with Charger/Discharger
+FUNCTION adjust_magnet_strength(magnet, point_heat)
+    IF point_heat < MIN_TEG_HEAT THEN
+        magnet.strength = MAGNET_STRENGTH_MIN
+        magnet.power = MAGNET_POWER * 0.5
+        magnet.charger_active = False
+    ELSE IF point_heat > MAX_TEG_HEAT * 0.8 THEN
+        magnet.strength = MAGNET_STRENGTH_MAX
+        magnet.power = MAGNET_POWER
+        magnet.charger_active = True
+    ELSE
+        magnet.strength = MAGNET_STRENGTH_MIN + (MAGNET_STRENGTH_MAX - MAGNET_STRENGTH_MIN) * (point_heat / MAX_TEG_HEAT)
+        magnet.power = MAGNET_POWER * (magnet.strength / MAGNET_STRENGTH_MAX)
+        magnet.charger_active = True
+    END
+    IF magnet.temp > MAGNET_TEMP_MAX THEN
+        magnet.strength = magnet.strength * 0.9
+        magnet.power = magnet.power * 0.9
+        magnet.charger_active = False
+        log_warning(LOG_FILE, "Magnet overheating at point " + magnet.point + ": " + magnet.temp + "°C")
+    END
+    IF magnet.strength < MAGNET_STRENGTH_MIN THEN
+        log_error(LOG_FILE, "Magnet failure at point " + magnet.point)
+        system_status = "Fault: Magnet Failure"
+        RETURN False
+    END
+    charger_power = magnet.charger_active ? CHARGER_POWER * CHARGER_EFF : 0
+    log_status(LOG_FILE, "Magnet at point " + magnet.point + ": Strength=" + magnet.strength + " T, Power=" + magnet.power + " W, Charger=" + (magnet.charger_active ? "Active" : "Inactive"))
+    RETURN True
+END
+
+FUNCTION monitor_magnets(point_heat_array)
+    FOR i = 1 TO 4
+        magnet = MAGNET_CONFIG[i - 1]
+        magnet.temp = read_magnet_temp(sensor="TI TMP117", point=magnet.point)
+        IF NOT adjust_magnet_strength(magnet, point_heat_array[i]) THEN
+            send_alert(API_ENDPOINT, "Magnet failure at point " + magnet.point)
+            RETURN False
+        END
+    END
+    magnet_power_total = SUM(magnet.power FOR magnet IN MAGNET_CONFIG)
+    charger_power_total = SUM(magnet.charger_active ? CHARGER_POWER * CHARGER_EFF : 0 FOR magnet IN MAGNET_CONFIG)
+    RETURN True
+END
+
+// Component: Ferrotec EFH1 Ferrofluid
+FUNCTION monitor_ferrofluid_flow(point_heat_array)
+    IF NOT monitor_magnets(point_heat_array) THEN
+        RETURN False
+    END
+    flow_status = check_flow(magnet="N45 array", tube="K&S 14 mm aluminum", sensor="Sensirion SLF3s-0600F")
+    flow_trend = 0.9 * flow_trend + 0.1 * flow_rate
+    IF flow_trend < 1.2 THEN
+        flow_rate = MIN(FLOW_BOOST + 0.1, 1.6)
+        log_warning(LOG_FILE, "Predictive flow adjustment: Flow trend=" + flow_trend + ", New flow=" + flow_rate)
+    END
+    IF NOT flow_status OR flow_rate < MIN_FLOW THEN
+        log_error(LOG_FILE, "Ferrofluid flow failure")
+        system_status = "Fault: Low Ferrofluid Flow"
+        flow_rate = MIN(FLOW_BOOST + 0.2, 1.7)
+        send_alert(API_ENDPOINT, "Ferrofluid flow failure")
+        RETURN False
+    END
+    RETURN True
+END
+
+// Component: Liquid Cooling System
+FUNCTION manage_cooling(waste_heat_out)
+    IF waste_heat_out > COOLING_ACTIVATION_THRESHOLD THEN
+        cooling_active = True
+        cooling_power = COOLING_POWER_MIN + (COOLING_POWER_MAX - COOLING_POWER_MIN) * (waste_heat_out / (waste_heat_out + 50))
+        log_status(LOG_FILE, "Liquid cooling activated: Waste heat=" + waste_heat_out + " W, Cooling power=" + cooling_power + " W")
+    ELSE
+        cooling_active = False
+        cooling_power = 0
+        log_status(LOG_FILE, "Liquid cooling deactivated: Waste heat=" + waste_heat_out + " W")
+    END
+    RETURN cooling_power
+END
+
+// Component: Solar Panel (3 m² Silicon PV)
+FUNCTION adjust_solar_input(storage_level, teg_power, base_load)
+    available_power = teg_power * BREAKER_EFF
+    solar_irradiance = fetch_solar_irradiance(API_ENDPOINT)  // Real-time weather data
+    max_solar_power = SOLAR_POWER * (solar_irradiance / 1000)  // Scale with irradiance (W/m²)
+    IF storage_level < THROTTLE_STORAGE_THRESHOLD AND available_power < base_load THEN
+        solar_factor = 1.0
+    ELSE IF storage_level > STORAGE_CAP * 0.9 THEN
+        solar_factor = 0.3
+    ELSE IF available_power >= base_load THEN
+        solar_factor = 0.5
+    ELSE
+        solar_factor = SOLAR_INPUT_FACTOR
+    END
+    solar_power = max_solar_power * solar_factor * SOLAR_REFLECTION_EFF
+    IF solar_factor < 0.2 THEN
+        log_warning(LOG_FILE, "Low solar input: " + solar_power + " W")
+    END
+    RETURN solar_power
+END
+
+// Component: AMD Ryzen 9 7950X CPU
+FUNCTION throttle_cpu(storage_level)
+    IF storage_level <= THROTTLE_STORAGE_THRESHOLD AND NOT cpu_throttled THEN
+        ongoing_processes = check_ongoing_processes(cpu="AMD Ryzen 9 7950X")
+        IF ongoing_processes THEN
+            prioritize_processes(processes=ongoing_processes, mode="low_power")
+        END
+        cpu_throttled = True
+        log_status(LOG_FILE, "Storage below 30% (" + storage_level + " Wh): Throttling CPU to 50% power")
+    ELSE IF storage_level > STORAGE_CAP * 0.5 AND cpu_throttled THEN
+        cpu_throttled = False
+        log_status(LOG_FILE, "Storage above 50% (" + storage_level + " Wh): Restoring full CPU power")
+    END
+END
+
+// Component: NVIDIA RTX 4090 GPU
+FUNCTION throttle_gpu(storage_level)
+    IF storage_level <= THROTTLE_STORAGE_THRESHOLD AND NOT gpu_throttled THEN
+        ongoing_processes = check_ongoing_processes(gpu="NVIDIA RTX 4090")
+        IF ongoing_processes THEN
+            prioritize_processes(processes=ongoing_processes, mode="low_power")
+        END
+        gpu_throttled = True
+        log_status(LOG_FILE, "Storage below 30% (" + storage_level + " Wh): Throttling GPU to 50% power")
+    ELSE IF storage_level > STORAGE_CAP * 0.5 AND gpu_throttled THEN
+        gpu_throttled = False
+        log_status(LOG_FILE, "Storage above 50% (" + storage_level + " Wh): Restoring full GPU power")
+    END
+END
+
+// Component: Component Temperature Monitoring
+FUNCTION monitor_temperatures()
+    component_temps.cpu = read_temp(sensor="TI TMP117", component="AMD Ryzen 9 7950X")
+    component_temps.gpu = read_temp(sensor="TI TMP117", component="NVIDIA RTX 4090")
+    component_temps.memory = read_temp(sensor="TI TMP117", component="DDR5 RAM")
+    component_temps.ssd = read_temp(sensor="TI TMP117", component="Samsung 990 Pro")
+    component_temps.motherboard = read_temp(sensor="TI TMP117", component="ASUS ROG Crosshair X670E")
+    
+    IF component_temps.cpu > CPU_TEMP_MAX THEN
+        log_error(LOG_FILE, "CPU overheating: " + component_temps.cpu + "°C")
+        system_status = "Fault: CPU Overheating"
+        throttle_cpu(storage_level)
+    END
+    IF component_temps.gpu > GPU_TEMP_MAX THEN
+        log_error(LOG_FILE, "GPU overheating: " + component_temps.gpu + "°C")
+        system_status = "Fault: GPU Overheating"
+        throttle_gpu(storage_level)
+    END
+    IF component_temps.memory > MEMORY_TEMP_MAX THEN
+        log_warning(LOG_FILE, "Memory overheating: " + component_temps.memory + "°C")
+        throttle_cpu(storage_level)
+    END
+    IF component_temps.ssd > SSD_TEMP_MAX THEN
+        log_warning(LOG_FILE, "SSD overheating: " + component_temps.ssd + "°C")
+        throttle_cpu(storage_level)
+    END
+    IF component_temps.motherboard > MOTHERBOARD_TEMP_MAX THEN
+        log_warning(LOG_FILE, "Motherboard overheating: " + component_temps.motherboard + "°C")
+        throttle_cpu(storage_level)
+    END
+END
+
+// Fault Recovery
+FUNCTION recover_from_fault(fault_type, point)
+    log_status(LOG_FILE, "Attempting recovery from " + fault_type + " at point " + point)
+    IF fault_type == "TEG Failure" THEN
+        reset_teg(point)
+        teg_health = check_teg_voltage(0, sensor="Analog Devices AD5940")
+        IF teg_health THEN
+            log_status(LOG_FILE, "TEG at point " + point + " recovered at 50% capacity")
+            RETURN True
+        END
+    ELSE IF fault_type == "Flow Failure" THEN
+        flush_ferrofluid(tube="K&S 14 mm aluminum")
+        flow_status = check_flow(magnet="N45 array", tube="K&S 14 mm aluminum", sensor="Sensirion SLF3s-0600F")
+        IF flow_status THEN
+            log_status(LOG_FILE, "Ferrofluid flow restored")
+            RETURN True
+        END
+    ELSE IF fault_type == "Magnet Failure" THEN
+        reset_magnet_charger(point)
+        magnet = MAGNET_CONFIG[point - 1]
+        magnet.strength = MAGNET_STRENGTH_MIN
+        magnet.charger_active = True
+        IF adjust_magnet_strength(magnet, MIN_TEG_HEAT) THEN
+            log_status(LOG_FILE, "Magnet at point " + point + " recovered")
+            RETURN True
+        END
+    END
+    log_error(LOG_FILE, "Recovery failed for " + fault_type + " at point " + point)
+    RETURN False
+END
+
+// Logging Functions
+FUNCTION log_status(file, message)
+    WRITE(file, TIMESTAMP() + " [STATUS] " + message)
+END
+
+FUNCTION log_warning(file, message)
+    WRITE(file, TIMESTAMP() + " [WARNING] " + message)
+END
+
+FUNCTION log_error(file, message)
+    WRITE(file, TIMESTAMP() + " [ERROR] " + message)
+END
+
+// Utility Functions
+FUNCTION read_fuel_gauge(sensor)
+    // Simulate reading battery fuel gauge
+    RETURN sensor_data(sensor)
+END
+
+FUNCTION check_teg_voltage(power, sensor)
+    // Simulate checking TEG voltage
+    RETURN sensor_data(sensor) > 0
+END
+
+FUNCTION read_magnet_temp(sensor, point)
+    // Simulate reading magnet temperature
+    RETURN sensor_data(sensor, point)
+END
+
+FUNCTION read_temp(sensor, component)
+    // Simulate reading component temperature
+    RETURN sensor_data(sensor, component)
+END
+
+FUNCTION check_flow(magnet, tube, sensor)
+    // Simulate checking ferrofluid flow
+    RETURN sensor_data(sensor) >= MIN_FLOW
+END
+
+FUNCTION fetch_solar_irradiance(endpoint)
+    // Simulate fetching real-time solar irradiance data (W/m²)
+    RETURN api_get(endpoint, "solar_irradiance") OR 1000  // Default to 1000 W/m² if API fails
+END
+
+FUNCTION check_ongoing_processes(component)
+    // Simulate checking CPU/GPU processes
+    RETURN process_list(component)
+END
+
+FUNCTION prioritize_processes(processes, mode)
+    // Simulate prioritizing processes
+    FOR EACH process IN processes
+        IF mode == "low_power" THEN
+            SET_PROCESS_PRIORITY(process, LOW)
+        ELSE
+            SET_PROCESS_PRIORITY(process, NORMAL)
+        END
+    END
+END
+
+FUNCTION reset_teg(point)
+    // Simulate resetting TEG at specified point
+    EXECUTE("reset_teg", point)
+END
+
+FUNCTION flush_ferrofluid(tube)
+    // Simulate flushing ferrofluid in tube
+    EXECUTE("flush_ferrofluid", tube)
+END
+
+FUNCTION reset_magnet_charger(point)
+    // Simulate resetting magnet charger/discharger
+    EXECUTE("reset_magnet_charger", point)
+END
+
+FUNCTION send_alert(endpoint, message)
+    // Simulate sending alert to API endpoint
+    api_post(endpoint, {alert: message, timestamp: TIMESTAMP()})
+END
+
+FUNCTION send_status(endpoint, status)
+    // Simulate sending system status to API endpoint
+    api_post(endpoint, status)
+END
+
+// Main System Loop
+FUNCTION run_system()
+    WHILE system_running
+        IF NOT booted THEN
+            IF storage_level >= BOOT_ENERGY THEN
+                storage_level = storage_level - BOOT_ENERGY
+                booted = True
+                log_status(LOG_FILE, "System booted successfully")
+            ELSE
+                log_error(LOG_FILE, "Insufficient energy to boot: " + storage_level + " Wh")
+                SLEEP(1000)  // Wait 1 second
+                CONTINUE
+            END
+        END
+
+        // Select load case (dynamic selection based on context, example: High-Load Server)
+        load_case = LOAD_CASES[1]  // High-Load Server
+        base_load = load_case.load
+        waste_heat = load_case.waste_heat
+
+        // Monitor battery
+        battery_capacity = monitor_battery_health()
+        throttle_cpu(storage_level)
+        throttle_gpu(storage_level)
+
+        // Monitor component temperatures
+        monitor_temperatures()
+
+        // Compute heat distribution
+        point_heat_array = [
+            waste_heat * 0.53,  // Point 1: CPU + waste heat
+            waste_heat * 0.05,  // Point 2: Carryover heat
+            waste_heat * 0.27,  // Point 3: GPU
+            waste_heat * 0.15   // Point 4: Exhaust
+        ]
+
+        // Monitor ferrofluid flow
+        IF NOT monitor_ferrofluid_flow(point_heat_array) THEN
+            IF NOT recover_from_fault("Flow Failure", 0) THEN
+                system_status = "Critical: Flow Failure"
+                system_running = False
+                CONTINUE
+            END
+        END
+
+        // Compute TEG power
+        teg_power = 0
+        FOR teg IN TEG_CONFIG
+            teg_power = teg_power + compute_teg_power(
+                point_heat_array[teg.point - 1],
+                teg.num_tegs,
+                teg.efficiency,
+                flow_rate,
+                teg.point,
+                teg.model
+            )
+        END
+
+        // Adjust solar input
+        solar_power = adjust_solar_input(storage_level, teg_power, base_load)
+
+        // Manage cooling
+        waste_heat_out = point_heat_array[3] * POINT_LOSS
+        cooling_power = manage_cooling(waste_heat_out)
+
+        // Compute power balance
+        total_power = teg_power * BREAKER_EFF + solar_power
+        total_consumption = base_load + cooling_power + magnet_power_total + charger_power_total
+        power_balance = total_power - total_consumption
+
+        // Update storage
+        storage_level = storage_level + power_balance * (0.08 / 3600)  // Convert W to Wh (80 ms cycle)
+        storage_level = MAX(0, MIN(storage_level, STORAGE_CAP))
+
+        // Log system status
+        log_status(LOG_FILE, "Status: " + system_status +
+            ", Storage=" + storage_level + " Wh" +
+            ", TEG Power=" + teg_power + " W" +
+            ", Solar Power=" + solar_power + " W" +
+            ", Load=" + base_load + " W" +
+            ", Balance=" + power_balance + " W" +
+            ", Temps: CPU=" + component_temps.cpu + "°C, GPU=" + component_temps.gpu + "°C")
+
+        // Check critical conditions
+        IF storage_level < MIN_STORAGE_THRESHOLD THEN
+            log_error(LOG_FILE, "Critical: Storage below 20% (" + storage_level + " Wh)")
+            system_status = "Critical: Low Storage"
+            system_running = False
+        END
+
+        // Real-time monitoring via xAI API
+        send_status(API_ENDPOINT, {
+            storage_level: storage_level,
+            system_status: system_status,
+            teg_power: teg_power,
+            solar_power: solar_power,
+            power_balance: power_balance,
+            component_temps: component_temps
+        })
+
+        SLEEP(80)  // 80 ms cycle
+    END
+    log_error(LOG_FILE, "System shutdown: " + system_status)
+END
+
+// Start the system
+run_system()
