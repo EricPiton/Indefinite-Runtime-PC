@@ -1,0 +1,589 @@
+// Hybrid Thermal Power System (HTPS) - Single Unit, No Solar
+// Goal: Self-sufficient, indefinite runtime post-boot, feasible in 2025
+// Components: CATL 1536 Wh LFP battery, AMD EPYC 9124 CPU, Supermicro H13SSL-N motherboard,
+//             16 GB DDR5 RAM, 512 GB NVMe SSD, 6 TEG6-242+ TEGs, Noctua NH-D15S cooling,
+//             Ferrotec EFH1+ ferrofluid, N52 magnets, TI sensors
+// Simulation cycle: 500 ms (1000 ms fallback for faults)
+// Heat source: CPU + 1000 W default waste heat (home-grade)
+
+// Constants
+CONST WASTE_HEAT_HOME = 1000 W            // Default: Home-grade waste heat
+CONST WASTE_HEAT_SERVER = 5000 W          // Optional: Server-grade waste heat
+CONST WASTE_HEAT = WASTE_HEAT_HOME        // Active heat source
+CONST STORAGE_CAP = 1536 Wh               // CATL LFP, 95% usable (1459.2 Wh)
+CONST MIN_STORAGE_THRESHOLD = 291.84 Wh   // 20% of usable capacity
+CONST THROTTLE_STORAGE_THRESHOLD = 437.76 Wh  // 30% of usable capacity
+CONST BOOT_ENERGY = 0.3 Wh                // Optimized boot energy
+CONST CHARGE_EFF = 0.96                   // Battery charge/discharge efficiency
+CONST CPU_POWER_MAX = 200 W               // AMD EPYC 9124
+CONST MOTHERBOARD_POWER_MAX = 15 W        // Supermicro H13SSL-N
+CONST MEMORY_POWER_MAX = 4 W              // 16 GB DDR5
+CONST SSD_POWER_MAX = 3 W                 // 512 GB NVMe SSD
+CONST COOLING_POWER_MIN = 0 W             // Noctua NH-D15S, passive
+CONST COOLING_POWER_MAX = 1 W             // Active fan
+CONST COOLING_ACTIVATION_THRESHOLD = 50 W // Cooling activation threshold
+CONST MAGNET_POWER = 0.25 W               // N52 magnet (2 magnets)
+CONST FLOW_REGULATOR_POWER = 0.5 W        // Lee VHS valve (2 valves)
+CONST TEG_CONTROL_POWER = 1 W             // TEG management
+CONST BREAKER_EFF = 0.96                  // TI TPS546B24A
+CONST REGULATOR_EFF = 0.995               // TI LM5176-Q1
+CONST HEAT_TO_TEG = 0.95                  // 95% heat transfer to TEGs
+CONST POINT_LOSS = 0.985                  // 1.5% loss per heat transfer point
+CONST COOLING_EFF = 0.995                 // Cooling efficiency
+CONST FLOW_BOOST = 1.2                    // 20% ferrofluid flow boost
+CONST MIN_FLOW = 0.1                      // Minimum EFH1+ ferrofluid flow
+CONST MAGNET_STRENGTH_MAX = 0.5 T         // N52 neodymium magnet
+CONST MAGNET_STRENGTH_MIN = 0.45 T        // 90% of max
+CONST MAGNET_TEMP_MAX = 70 °C             // N52 temperature limit
+CONST MAGNET_HEAT_PULL_EFF = 0.98         // 98% heat pull efficiency
+CONST MAGNET_FLOW_PUSH_EFF = 0.99         // 99% flow push efficiency
+CONST MIN_TEG_HEAT = 20 W                 // Minimum heat for TEG6-242+
+CONST MAX_TEG_HEAT = 6000 W               // Maximum TEG heat input
+CONST TEG_RECOVERY_THRESHOLD = 5 W        // Minimum TEG power for recovery
+CONST BATTERY_DEGRADATION_THRESHOLD = 1228.8 Wh  // 80% of nominal capacity
+CONST CPU_TEMP_MAX = 95 °C                // Max CPU temperature
+CONST MEMORY_TEMP_MAX = 85 °C             // Max DDR5 RAM temperature
+CONST SSD_TEMP_MAX = 70 °C                // Max NVMe SSD temperature
+CONST MOTHERBOARD_TEMP_MAX = 80 °C        // Max motherboard temperature
+CONST MASS = 12 kg                        // 8 kg system + 4 kg battery
+CONST COST = 3500 USD                     // $2000 system + $1500 battery
+CONST LOG_FILE = "htps_status.log"
+CONST CYCLE_TIME = 500                    // Normal cycle time (ms)
+CONST FAULT_CYCLE_TIME = 1000             // Fallback cycle time (ms)
+
+// TEG Configuration
+CONST TEG_CONFIG = [
+    {point: 1, num_tegs: 3, efficiency: 0.15, model: "TEG6-242+"}, // CPU + waste heat
+    {point: 2, num_tegs: 3, efficiency: 0.15, model: "TEG6-242+"}  // Exhaust
+]
+
+// Magnet Configuration
+VAR MAGNET_CONFIG = [
+    {point: 1, strength: MAGNET_STRENGTH_MAX, temp: 25 °C, power: MAGNET_POWER, charger_active: False},
+    {point: 2, strength: MAGNET_STRENGTH_MAX, temp: 25 °C, power: MAGNET_POWER, charger_active: False}
+]
+
+// Component Configuration
+CONST COMPONENTS = [
+    {name: "AMD EPYC 9124", power: 0 W, max_power: CPU_POWER_MAX, temp: 25 °C},
+    {name: "Supermicro H13SSL-N", power: MOTHERBOARD_POWER_MAX, max_power: MOTHERBOARD_POWER_MAX},
+    {name: "DDR5 RAM", power: MEMORY_POWER_MAX, max_power: MEMORY_POWER_MAX, temp: 25 °C},
+    {name: "Samsung 990 Pro", power: SSD_POWER_MAX, max_power: SSD_POWER_MAX, temp: 25 °C},
+    {name: "Noctua NH-D15‘Itua NH-D15S", power: 0 W, max_power: COOLING_POWER_MAX, active: False},
+    {name: "TEG Control", power: TEG_CONTROL_POWER, max_power: TEG_CONTROL_POWER},
+    {name: "Lee VHS Valve Point 1", power: FLOW_REGULATOR_POWER, max_power: FLOW_REGULATOR_POWER},
+    {name: "Lee VHS Valve Point 2", power: FLOW_REGULATOR_POWER, max_power: FLOW_REGULATOR_POWER}
+]
+
+// Load Modes
+CONST LOAD_MODES = [
+    {mode: "Idle", total: 7 W, cpu: 1 W, motherboard: 1 W, ram: 1 W, ssd: 1 W, teg_control: 1 W, flow_regulators: 2 W, waste_heat: WASTE_HEAT},
+    {mode: "Mid", total: 50 W, cpu: 40 W, motherboard: 3 W, ram: 2 W, ssd: 2 W, teg_control: 1 W, flow_regulators: 2 W, waste_heat: WASTE_HEAT},
+    {mode: "Max", total: 225 W, cpu: 200 W, motherboard: 15 W, ram: 4 W, ssd: 3 W, teg_control: 1 W, flow_regulators: 2 W, waste_heat: WASTE_HEAT}
+]
+
+// Initialize System State
+VAR storage_level = STORAGE_CAP            // 1536 Wh
+VAR system_status = "Operational"
+VAR cpu_throttled = False
+VAR flow_rate = FLOW_BOOST                // Initial ferrofluid flow (1.2)
+VAR system_running = True
+VAR booted = False
+VAR magnet_power_total = 2 * MAGNET_POWER  // 0.5 W (2 magnets)
+VAR cooling_active = False
+VAR cooling_power = 0 W
+VAR flow_trend = 1.2                      // Predictive flow trend
+VAR battery_capacity = STORAGE_CAP        // 1536 Wh
+VAR component_temps = {cpu: 25 °C, ram: 25 °C, ssd: 25 °C, motherboard: 25 °C}
+
+// Logging Functions
+FUNCTION log_status(file, message)
+    WRITE(file, TIMESTAMP() + " [STATUS] " + message)
+END
+
+FUNCTION log_warning(file, message)
+    WRITE(file, TIMESTAMP() + " [WARNING] " + message)
+END
+
+FUNCTION log_error(file, message)
+    WRITE(file, TIMESTAMP() + " [ERROR] " + message)
+END
+
+FUNCTION log_diagnostic(file, message)
+    WRITE(file, TIMESTAMP() + " [DIAGNOSTIC] " + message)
+END
+
+// Utility Functions
+FUNCTION read_fuel_gauge(sensor)
+    RETURN sensor_data(sensor) * STORAGE_CAP  // Wh
+END
+
+FUNCTION check_teg_voltage(power, sensor)
+    voltage = sensor_data(sensor)
+    RETURN voltage >= 12 V
+END
+
+FUNCTION read_magnet_temp(sensor, point)
+    RETURN sensor_data(sensor, point)
+END
+
+FUNCTION read_temp(sensor, component)
+    RETURN sensor_data(sensor, component)
+END
+
+FUNCTION check_flow(magnet, tube, sensor)
+    RETURN sensor_data(sensor) >= MIN_FLOW
+END
+
+FUNCTION prioritize_processes(processes, mode)
+    FOR EACH process IN processes
+        SET_PROCESS_PRIORITY(process, mode == "low_power" ? LOW : NORMAL)
+    END
+END
+
+FUNCTION reset_teg(point)
+    EXECUTE("reset_teg", point)
+END
+
+FUNCTION flush_ferrofluid(tube)
+    EXECUTE("flush_ferrofluid", tube)
+END
+
+// Component: CATL LFP Battery
+FUNCTION monitor_battery()
+    battery_capacity = read_fuel_gauge(sensor="TI BQ34Z100-G1")
+    IF battery_capacity < BATTERY_DEGRADATION_THRESHOLD THEN
+        log_warning(LOG_FILE, "Battery degradation: Capacity=" + battery_capacity + " Wh")
+        log_diagnostic(LOG_FILE, "Battery: Capacity=" + battery_capacity + " Wh, SoC=" + (battery_capacity / STORAGE_CAP * 100) + "%")
+    END
+    soc = battery_capacity / STORAGE_CAP
+    IF soc < 0.2 THEN
+        log_warning(LOG_FILE, "Battery SoC < 20%: " + battery_capacity + " Wh")
+    END
+    RETURN battery_capacity
+END
+
+// Component: TEG6-242+ Thermoelectric Generators
+FUNCTION compute_teg_power(point_heat, num_tegs, teg_efficiency, flow_rate, point, model)
+    IF flow_rate < MIN_FLOW THEN
+        log_error(LOG_FILE, "Low ferrofluid flow at point " + point)
+        system_status = "Fault: Low Flow"
+        RETURN 0 W
+    END
+    IF point_heat < MIN_TEG_HEAT THEN
+        log_warning(LOG_FILE, "Insufficient heat at point " + point + ": " + point_heat + " W")
+        RETURN 0 W
+    END
+    IF point_heat > MAX_TEG_HEAT THEN
+        log_warning(LOG_FILE, "Excessive heat at point " + point + ": " + point_heat + " W")
+        point_heat = MAX_TEG_HEAT
+    END
+    heat_to_teg = point_heat * MAGNET_HEAT_PULL_EFF
+    teg_power = heat_to_teg * POINT_LOSS * HEAT_TO_TEG * teg_efficiency * REGULATOR_EFF * COOLING_EFF * num_tegs
+    teg_health = check_teg_voltage(teg_power, sensor="Analog Devices AD5940")
+    IF NOT teg_health OR teg_power <= TEG_RECOVERY_THRESHOLD THEN
+        log_error(LOG_FILE, "TEG failure at point " + point + ", model=" + model)
+        system_status = "Fault: TEG Failure"
+        IF recover_from_fault("TEG Failure", point) THEN
+            RETURN teg_power * 0.5
+        END
+        RETURN 0 W
+    END
+    log_status(LOG_FILE, model + " at point " + point + ": " + teg_power + " W")
+    RETURN teg_power
+END
+
+// Component: N52 Neodymium Magnets
+FUNCTION adjust_magnet_strength(magnet, point_heat)
+    IF point_heat < MIN_TEG_HEAT THEN
+        magnet.strength = MAGNET_STRENGTH_MIN
+        magnet.power = MAGNET_POWER * 0.5
+        magnet.charger_active = False
+    ELSE IF point_heat > MAX_TEG_HEAT * 0.8 THEN
+        magnet.strength = MAGNET_STRENGTH_MAX
+        magnet.power = MAGNET_POWER
+        magnet.charger_active = True
+    ELSE
+        magnet.strength = MAGNET_STRENGTH_MIN + (MAGNET_STRENGTH_MAX - MAGNET_STRENGTH_MIN) * (point_heat / MAX_TEG_HEAT)
+        magnet.power = MAGNET_POWER * (magnet.strength / MAGNET_STRENGTH_MAX)
+        magnet.charger_active = True
+    END
+    IF magnet.temp > MAGNET_TEMP_MAX THEN
+        magnet.strength = magnet.strength * 0.9
+        magnet.power = magnet.power * 0.9
+        magnet.charger_active = False
+        log_warning(LOG_FILE, "Magnet overheating at point " + magnet.point + ": " + magnet.temp + "°C")
+    END
+    IF magnet.strength < MAGNET_STRENGTH_MIN THEN
+        log_error(LOG_FILE, "Magnet failure at point " + magnet.point)
+        system_status = "Fault: Magnet Failure"
+        RETURN False
+    END
+    log_status(LOG_FILE, "Magnet at point " + magnet.point + ": Strength=" + magnet.strength + " T, Power=" + magnet.power + " W")
+    RETURN True
+END
+
+FUNCTION monitor_magnets(point_heat_array)
+    FOR i = 1 TO 2
+        magnet = MAGNET_CONFIG[i - 1]
+        magnet.temp = read_magnet_temp(sensor="TI TMP117", point=magnet.point)
+        IF NOT adjust_magnet_strength(magnet, point_heat_array[i]) THEN
+            RETURN False
+        END
+    END
+    magnet_power_total = SUM(magnet.power FOR magnet IN MAGNET_CONFIG)
+    RETURN True
+END
+
+// Component: Ferrotec EFH1+ Ferrofluid
+FUNCTION regulate_ferrofluid_flow(target_flow, point)
+    flow_rate = read_flow_sensor("Sensirion SLF3s-0600F", point)
+    IF flow_rate < MIN_FLOW THEN
+        log_error(LOG_FILE, "Low flow at point " + point + ": " + flow_rate)
+        system_status = "Fault: Low Flow"
+        RETURN MIN_FLOW
+    END
+    adjust_valve("Lee VHS Micro-Dispensing Valve", point, target=target_flow, power=FLOW_REGULATOR_POWER)
+    new_flow = read_flow_sensor("Sensirion SLF3s-0600F", point)
+    log_status(LOG_FILE, "Flow regulated at point " + point + ": " + new_flow)
+    RETURN new_flow
+END
+
+FUNCTION monitor_ferrofluid_flow(point_heat_array)
+    IF NOT monitor_magnets(point_heat_array) THEN
+        RETURN False
+    END
+    flow_status = True
+    FOR EACH point IN TEG_CONFIG
+        flow_rate = regulate_ferrofluid_flow(FLOW_BOOST, point.point)
+        IF flow_rate < MIN_FLOW THEN
+            flow_status = False
+        END
+    END
+    flow_trend = 0.9 * flow_trend + 0.1 * flow_rate
+    IF flow_trend < 1.1 THEN
+        flow_rate = MIN(FLOW_BOOST + 0.1, 1.3)
+        log_warning(LOG_FILE, "Predictive flow adjustment: Trend=" + flow_trend + ", Flow=" + flow_rate)
+    END
+    IF NOT flow_status THEN
+        log_error(LOG_FILE, "Ferrofluid flow failure")
+        system_status = "Fault: Low Ferrofluid Flow"
+        RETURN False
+    END
+    RETURN True
+END
+
+// Component: Cooling System
+FUNCTION manage_cooling(waste_heat_out)
+    IF waste_heat_out > COOLING_ACTIVATION_THRESHOLD THEN
+        cooling_active = True
+        cooling_power = COOLING_POWER_MAX
+        COMPONENTS[4].power = cooling_power
+        COMPONENTS[4].active = True
+        log_status(LOG_FILE, "Cooling activated: Waste heat=" + waste_heat_out + " W, Power=" + cooling_power + " W")
+    ELSE
+        cooling_active = False
+        cooling_power = 0 W
+        COMPONENTS[4].power = 0 W
+        COMPONENTS[4].active = False
+        log_status(LOG_FILE, "Cooling deactivated")
+    END
+    IF NOT cool(waste_heat_out, method="Noctua NH-D15S, heat pipes, fan=" + cooling_active) THEN
+        log_error(LOG_FILE, "Cooling failure: Waste heat=" + waste_heat_out + " W")
+        system_status = "Fault: Cooling Failure"
+        RETURN 0 W
+    END
+    RETURN cooling_power
+END
+
+// Component: CPU Throttling
+FUNCTION throttle_cpu(storage_level)
+    IF storage_level <= THROTTLE_STORAGE_THRESHOLD AND NOT cpu_throttled THEN
+        prioritize_processes(check_ongoing_processes(cpu="AMD EPYC 9124"), mode="low_power")
+        cpu_throttled = True
+        log_status(LOG_FILE, "Throttling CPU to 50%: Storage=" + storage_level + " Wh")
+    ELSE IF storage_level > STORAGE_CAP * 0.5 AND cpu_throttled THEN
+        cpu_throttled = False
+        log_status(LOG_FILE, "Restoring CPU: Storage=" + storage_level + " Wh")
+    END
+    RETURN cpu_throttled
+END
+
+// Component: Temperature Monitoring
+FUNCTION monitor_temperatures()
+    component_temps.cpu = read_temp(sensor="TI TMP117", component="AMD EPYC 9124")
+    component_temps.ram = read_temp(sensor="TI TMP117", component="DDR5 RAM")
+    component_temps.ssd = read_temp(sensor="TI TMP117", component="Samsung 990 Pro")
+    component_temps.motherboard = read_temp(sensor="TI TMP117", component="Supermicro H13SSL-N")
+    
+    COMPONENTS[0].temp = component_temps.cpu
+    COMPONENTS[2].temp = component_temps.ram
+    COMPONENTS[3].temp = component_temps.ssd
+    
+    IF component_temps.cpu > CPU_TEMP_MAX THEN
+        log_error(LOG_FILE, "CPU overheating: " + component_temps.cpu + "°C")
+        system_status = "Fault: CPU Overheating"
+        throttle_cpu(storage_level)
+    END
+    IF component_temps.ram > MEMORY_TEMP_MAX THEN
+        log_warning(LOG_FILE, "Memory overheating: " + component_temps.ram + "°C")
+        throttle_cpu(storage_level)
+    END
+    IF component_temps.ssd > SSD_TEMP_MAX THEN
+        log_warning(LOG_FILE, "SSD overheating: " + component_temps.ssd + "°C")
+        throttle_cpu(storage_level)
+    END
+    IF component_temps.motherboard > MOTHERBOARD_TEMP_MAX THEN
+        log_warning(LOG_FILE, "Motherboard overheating: " + component_temps.motherboard + "°C")
+        throttle_cpu(storage_level)
+    END
+    log_diagnostic(LOG_FILE, "Temps: CPU=" + component_temps.cpu + "°C, RAM=" + component_temps.ram + "°C, SSD=" + component_temps.ssd + "°C, Motherboard=" + component_temps.motherboard + "°C")
+END
+
+// Fault Recovery
+FUNCTION recover_from_fault(fault_type, point)
+    log_status(LOG_FILE, "Recovering from " + fault_type + " at point " + point)
+    IF fault_type == "TEG Failure" THEN
+        reset_teg(point)
+        IF check_teg_voltage(0, sensor="Analog Devices AD5940") THEN
+            log_status(LOG_FILE, "TEG recovered at point " + point)
+            system_status = "Operational"
+            RETURN True
+        END
+    ELSE IF fault_type == "Low Ferrofluid Flow" THEN
+        flush_ferrofluid(tube="K&S 14 mm aluminum")
+        IF check_flow(magnet="N52 array", tube="K&S 14 mm aluminum", sensor="Sensirion SLF3s-0600F") THEN
+            log_status(LOG_FILE, "Ferrofluid flow restored")
+            system_status = "Operational"
+            RETURN True
+        END
+    ELSE IF fault_type == "Magnet Failure" THEN
+        reset_magnet_charger(point)
+        magnet = MAGNET_CONFIG[point - 1]
+        magnet.strength = MAGNET_STRENGTH_MIN
+        magnet.charger_active = True
+        IF adjust_magnet_strength(magnet, MIN_TEG_HEAT) THEN
+            log_status(LOG_FILE, "Magnet recovered at point " + point)
+            system_status = "Operational"
+            RETURN True
+        END
+    ELSE IF fault_type == "CPU Overheating" THEN
+        throttle_cpu(storage_level)
+        cooling_active = True
+        cooling_power = COOLING_POWER_MAX
+        COMPONENTS[4].power = cooling_power
+        COMPONENTS[4].active = True
+        log_status(LOG_FILE, "Thermal recovery: Forced cooling")
+        system_status = "Operational"
+        RETURN True
+    ELSE IF fault_type == "Cooling Failure" THEN
+        cooling_active = True
+        cooling_power = COOLING_POWER_MAX
+        COMPONENTS[4].power = cooling_power
+        COMPONENTS[4].active = True
+        IF cool(50 W, method="Noctua NH-D15S, heat pipes, fan=True") THEN
+            log_status(LOG_FILE, "Cooling recovered")
+            system_status = "Operational"
+            RETURN True
+        END
+    ELSE IF fault_type == "Low Storage" THEN
+        log_status(LOG_FILE, "Low storage: Switching to Idle")
+        system_status = "Operational"
+        RETURN True
+    END
+    log_error(LOG_FILE, "Recovery failed: " + fault_type)
+    RETURN False
+END
+
+// Power Distribution and Load Management
+FUNCTION adjust_load(load_mode, storage_level, available_power)
+    base_load = load_mode.total
+    IF storage_level <= MIN_STORAGE_THRESHOLD THEN
+        log_status(LOG_FILE, "Storage < 20% (" + storage_level + " Wh): Forcing Idle")
+        RETURN LOAD_MODES[0]  // Idle
+    END
+    IF available_power >= base_load THEN
+        log_status(LOG_FILE, "Sufficient power: Load=" + base_load + " W")
+        RETURN load_mode
+    END
+    IF available_power >= LOAD_MODES[1].total AND base_load > LOAD_MODES[1].total THEN
+        log_status(LOG_FILE, "Switching to Mid load")
+        RETURN LOAD_MODES[1]
+    END
+    log_status(LOG_FILE, "Switching to Idle")
+    RETURN LOAD_MODES[0]
+END
+
+FUNCTION distribute_power(total_power, load_mode, storage_level)
+    breaker_output = total_power * BREAKER_EFF
+    total_consumption = load_mode.total + cooling_power + magnet_power_total
+    IF breaker_output < total_consumption THEN
+        deficit = total_consumption - breaker_output
+        IF storage_level > 0 THEN
+            discharge = MIN(deficit / (3600 * 1000 / CYCLE_TIME), storage_level) * CHARGE_EFF
+            storage_level = storage_level - discharge
+            breaker_output = breaker_output + (discharge * (3600 * 1000 / CYCLE_TIME))
+            log_status(LOG_FILE, "Discharging: " + deficit + " W, Storage=" + storage_level + " Wh")
+        ELSE
+            log_error(LOG_FILE, "Storage depleted: Forcing Idle")
+            system_status = "Fault: Low Storage"
+            RETURN 0 W, storage_level, LOAD_MODES[0]
+        END
+    END
+    FOR EACH comp IN COMPONENTS
+        IF comp.name == "AMD EPYC 9124" THEN
+            comp.power = load_mode.cpu
+        ELSE IF comp.name == "Supermicro H13SSL-N" THEN
+            comp.power = load_mode.motherboard
+        ELSE IF comp.name == "DDR5 RAM" THEN
+            comp.power = load_mode.ram
+        ELSE IF comp.name == "Samsung 990 Pro" THEN
+            comp.power = load_mode.ssd
+        ELSE IF comp.name == "Noctua NH-D15S" THEN
+            comp.power = cooling_power
+        ELSE
+            comp.power = comp.max_power
+        END
+        distribute_to_component(breaker_output, comp, voltage=12 V, regulator="TI TPS546B24A")
+    END
+    excess = breaker_output - total_consumption
+    IF excess > 0 AND storage_level < STORAGE_CAP THEN
+        charge = MIN(excess / (3600 * 1000 / CYCLE_TIME), STORAGE_CAP - storage_level) * CHARGE_EFF
+        storage_level = storage_level + charge
+        log_status(LOG_FILE, "Charging: " + excess + " W, Storage=" + storage_level + " Wh")
+    ELSE IF excess > 0 THEN
+        dissipate_excess(excess, discharger="Ohmite TGHG 100 W")
+        log_status(LOG_FILE, "Dissipating excess: " + excess + " W")
+    END
+    RETURN excess, storage_level, load_mode
+END
+
+// Main System Loop
+FUNCTION run_system()
+    WHILE system_running
+        cycle_time = system_status CONTAINS "Fault" ? FAULT_CYCLE_TIME : CYCLE_TIME
+        current_time = SYSTEM_TIME()  // ms since epoch
+        
+        IF NOT booted THEN
+            boot_power = 0 W
+            IF storage_level < BOOT_ENERGY THEN
+                log_status(LOG_FILE, "Storage below 0.3 Wh: Booting with PSU AC mode")
+                system_status = "Warning: PSU AC Boot"
+                boot_power = draw_ac_power(voltage=12 V, efficiency=0.94)  // Seasonic Prime TX-1600
+                distribute_to_components(boot_power, COMPONENTS, voltage=12 V, regulator="TI TPS546B24A")
+                log_status(LOG_FILE, "Booting with PSU AC: " + boot_power + " W")
+            ELSE
+                storage_level = storage_level - BOOT_ENERGY
+                booted = True
+                log_status(LOG_FILE, "System booted")
+            END
+        END
+
+        // Monitor battery
+        battery_capacity = monitor_battery()
+        storage_level = MIN(storage_level, battery_capacity)
+
+        // Select load mode (rotate for testing, replace with demand-driven logic in production)
+        load_mode_index = (load_mode_index + 1) MOD 3
+        load_mode = LOAD_MODES[load_mode_index]
+        base_load = load_mode.total
+        waste_heat = load_mode.waste_heat
+
+        // Throttle CPU
+        cpu_throttled = throttle_cpu(storage_level)
+        adjusted_cpu_power = load_mode.cpu * (0.5 IF cpu_throttled ELSE 1.0)
+
+        // Monitor temperatures
+        monitor_temperatures()
+        IF system_status CONTAINS "Overheating" THEN
+            IF NOT recover_from_fault(system_status, 0) THEN
+                system_running = False
+                log_error(LOG_FILE, "Unrecoverable overheating")
+                BREAK
+            END
+        END
+
+        // Compute heat distribution
+        cpu_heat = adjusted_cpu_power * 1.2
+        total_heat = cpu_heat + waste_heat
+        point1_heat = (cpu_heat + waste_heat) * flow_rate
+        point2_heat = point1_heat * MAGNET_FLOW_PUSH_EFF * POINT_LOSS
+        point_heat_array = [point1_heat, point2_heat]
+
+        // Monitor ferrofluid
+        IF NOT monitor_ferrofluid_flow(point_heat_array) THEN
+            IF NOT recover_from_fault("Low Ferrofluid Flow", 0) THEN
+                system_running = False
+                log_error(LOG_FILE, "Unrecoverable flow failure")
+                BREAK
+            END
+        END
+
+        // Compute TEG power
+        total_teg_power = 0 W
+        FOR teg IN TEG_CONFIG
+            total_teg_power = total_teg_power + compute_teg_power(
+                point_heat_array[teg.point - 1],
+                teg.num_tegs,
+                teg.efficiency,
+                flow_rate,
+                teg.point,
+                teg.model
+            )
+        END
+
+        // Manage cooling
+        waste_heat_out = point2_heat * MAGNET_FLOW_PUSH_EFF
+        cooling_power = manage_cooling(waste_heat_out)
+
+        // Power balance and load adjustment
+        total_power = total_teg_power
+        adjusted_load = adjust_load(load_mode, storage_level, total_power)
+        excess, storage_level, adjusted_load = distribute_power(total_power, adjusted_load, storage_level)
+
+        // Handle low storage
+        IF storage_level < MIN_STORAGE_THRESHOLD AND system_status != "Fault: Low Storage" THEN
+            system_status = "Fault: Low Storage"
+            IF NOT recover_from_fault("Low Storage", 0) THEN
+                system_running = False
+                log_error(LOG_FILE, "Unrecoverable low storage")
+                BREAK
+            END
+        END
+
+        // Compute efficiency
+        efficiency = (total_heat > 0) ? (total_teg_power / total_heat) * 100 : 0
+
+        // Log status
+        log_status(LOG_FILE, "Mode: " + adjusted_load.mode +
+            ", Status: " + system_status +
+            ", Storage: " + storage_level + " Wh" +
+            ", TEG: " + total_teg_power + " W" +
+            ", Load: " + adjusted_load.total + " W" +
+            ", Excess: " + excess + " W" +
+            ", Efficiency: " + efficiency + "%")
+        
+        log_diagnostic(LOG_FILE, "Cycle: Time=" + cycle_time + " ms" +
+            ", Flow=" + flow_rate +
+            ", Magnets=" + magnet_power_total + " W" +
+            ", Cooling=" + cooling_power + " W")
+
+        // Print self-sufficiency status
+        IF excess >= 0 THEN
+            IF storage_level >= STORAGE_CAP THEN
+                PRINT "System self-sufficient: Excess power = ", excess, " W dissipated, Storage = ", storage_level, " Wh"
+            ELSE
+                PRINT "System self-sufficient: Excess power = ", excess, " W charging, Storage = ", storage_level, " Wh"
+            END
+        ELSE
+            PRINT "System not self-sufficient: Deficit = ", excess, " W, Storage = ", storage_level, " Wh"
+        END
+
+        SLEEP(cycle_time)
+    END
+    log_error(LOG_FILE, "Shutdown: " + system_status)
+END
+
+// Start System
+VAR load_mode_index = 0
+run_system()
